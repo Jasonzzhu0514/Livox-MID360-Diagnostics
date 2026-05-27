@@ -1,0 +1,113 @@
+name: 发布 GitHub Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: 从版本标签发布 Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 校验标签与版本文件
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+
+          python3 scripts/release/validate_release.py --tag "${TAG}" --require-tag-at-head
+
+          IFS=. read -r MAJOR MINOR PATCH <<< "${VERSION}"
+          if [[ -z "${MAJOR}" || -z "${MINOR}" || -z "${PATCH}" ]]; then
+            echo "VERSION must use <major>.<minor>.<patch>: ${VERSION}" >&2
+            exit 1
+          fi
+          if [[ "${PATCH}" == "0" ]]; then
+            DISPLAY_VERSION="${MAJOR}.${MINOR}"
+          else
+            DISPLAY_VERSION="${VERSION}"
+          fi
+
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "display_version=${DISPLAY_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: 安装编译依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
+
+      - name: 构建 Linux x86_64 预编译包
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package_cpp_prebuilt.sh "${{ steps.version.outputs.version }}"
+
+      - name: 计算上一版本标签
+        id: previous
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          PREVIOUS_TAG="$(
+            git tag --sort=-v:refname \
+              | grep -E '^v[0-9]+[.][0-9]+[.][0-9]+$' \
+              | grep -Fxv "${TAG}" \
+              | head -n 1 || true
+          )"
+          echo "tag=${PREVIOUS_TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: 生成 Release 说明
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(
+            --version "${{ steps.version.outputs.version }}"
+            --changelog CHANGELOG.md
+            --output release-notes.md
+            --repo "${GITHUB_REPOSITORY}"
+            --current-tag "${{ steps.version.outputs.tag }}"
+          )
+
+          if [[ -n "${{ steps.previous.outputs.tag }}" ]]; then
+            ARGS+=(--previous-tag "${{ steps.previous.outputs.tag }}")
+          fi
+
+          python3 scripts/release/extract_changelog.py "${ARGS[@]}"
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          TITLE="Livox MID360 Diagnostics v${{ steps.version.outputs.display_version }}"
+          shopt -s nullglob
+          ASSETS=(dist/prebuilt/*.tar.gz)
+
+          if (( ${#ASSETS[@]} == 0 )); then
+            echo "No prebuilt packages found in dist/prebuilt" >&2
+            exit 1
+          fi
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release already exists for ${TAG}" >&2
+            exit 1
+          fi
+
+          gh release create "${TAG}" "${ASSETS[@]}" --title "${TITLE}" --notes-file release-notes.md

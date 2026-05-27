@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "livox-mid360-diagnostics"
+dynamic = ["version"]
+description = "Python and C++ utilities for Livox MID360 discovery, config update, and live data monitoring."
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+livox-mid360-diagnostics = "livox_mid360_diagnostics.__main__:main"
+
+[tool.setuptools]
+package-dir = {"" = "src/python"}
+
+[tool.setuptools.packages.find]
+where = ["src/python"]
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}
