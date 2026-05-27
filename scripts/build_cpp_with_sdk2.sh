@@ -19,7 +19,9 @@ if [[ ! -f "$sdk_root/build/sdk_core/liblivox_lidar_sdk_static.a" && ! -f "$sdk_
   if [[ -f "$sdk_root/build/CMakeCache.txt" ]] && ! grep -Fq "$sdk_root" "$sdk_root/build/CMakeCache.txt"; then
     rm -rf "$sdk_root/build"
   fi
-  cmake -S "$sdk_root" -B "$sdk_root/build" -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  cmake -S "$sdk_root" -B "$sdk_root/build" \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_CXX_FLAGS="${CMAKE_CXX_FLAGS:-} -include cstdint"
   cmake --build "$sdk_root/build" --target livox_lidar_sdk_static -j"$(nproc)"
 fi
 
