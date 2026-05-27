@@ -17,7 +17,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          submodules: recursive
 
       - name: 校验标签与版本文件
         id: version
@@ -44,18 +43,22 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
           echo "display_version=${DISPLAY_VERSION}" >> "${GITHUB_OUTPUT}"
 
-      - name: 安装编译依赖
+      - name: 校验预编译附件
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
+          VERSION="${{ steps.version.outputs.version }}"
+          REQUIRED=(
+            "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
+            "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
+          )
 
-      - name: 构建 Linux x86_64 预编译包
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./scripts/package_cpp_prebuilt.sh "${{ steps.version.outputs.version }}"
+          for asset in "${REQUIRED[@]}"; do
+            if [[ ! -s "${asset}" ]]; then
+              echo "Missing release asset: ${asset}" >&2
+              exit 1
+            fi
+          done
 
       - name: 计算上一版本标签
         id: previous
@@ -97,13 +100,11 @@ jobs:
           set -euo pipefail
           TAG="${{ steps.version.outputs.tag }}"
           TITLE="Livox MID360 Diagnostics v${{ steps.version.outputs.display_version }}"
-          shopt -s nullglob
-          ASSETS=(dist/prebuilt/*.tar.gz)
-
-          if (( ${#ASSETS[@]} == 0 )); then
-            echo "No prebuilt packages found in dist/prebuilt" >&2
-            exit 1
-          fi
+          VERSION="${{ steps.version.outputs.version }}"
+          ASSETS=(
+            "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
+            "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
+          )
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release already exists for ${TAG}" >&2

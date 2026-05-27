@@ -180,7 +180,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-Release workflow 会校验 `VERSION`、tag 和 `CHANGELOG.md` 是否一致，构建 Linux x86_64 预编译包，并上传 `dist/prebuilt/*.tar.gz`。当前 v1.0.0 已准备好两个附件：
+Release workflow 会校验 `VERSION`、tag、`CHANGELOG.md` 和 `dist/prebuilt/` 里的预编译包是否一致，然后直接把预编译包上传为附件。当前 v1.0.0 已准备好两个附件：
 
 ```text
 livox-mid360-diagnostics-cpp-1.0.0-linux-x86_64.tar.gz
