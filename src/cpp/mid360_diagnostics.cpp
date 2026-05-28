@@ -37,7 +37,8 @@ void usage(const char* argv0) {
       << "usage: " << argv0 << " [autoconfig|monitor|dump] [args...]\n"
       << "\n"
       << "C++ entry point for Livox MID360 diagnostics.\n"
-      << "For monitor/dump, LIVOX_MID360_CONFIG is added automatically when set.\n"
+      << "For dump, LIVOX_MID360_CONFIG is added automatically when set.\n"
+      << "Monitor discovers the lidar by default and does not consume the configured lidar IP.\n"
       << "Run without arguments to open the interactive menu.\n"
       << "\n"
       << "commands:\n"
@@ -160,7 +161,7 @@ bool file_exists(const std::string& path) {
 }
 
 bool command_needs_config(const std::string& command) {
-  return command == "monitor" || command == "sdk-monitor" || command == "dump" || command == "sdk-dump";
+  return command == "dump" || command == "sdk-dump";
 }
 
 }  // namespace

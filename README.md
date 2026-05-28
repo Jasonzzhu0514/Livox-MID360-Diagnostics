@@ -44,7 +44,7 @@ livox-mid360-diagnostics udp-monitor
 
 含义：
 
-- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用方向键菜单选择要更新的 JSON。
+- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用带颜色的方向键菜单选择要更新的 JSON。
 - `udp-monitor`：被动监听配置里的 UDP 端口，查看是否收到数据。
 
 Python 版不会向雷达发送 SDK 控制命令。
@@ -89,8 +89,8 @@ source ./env.sh
 含义：
 
 - 直接运行 `livox_mid360_diagnostics`：显示 `autoconfig`、`monitor`、`dump`、`quit` 四个交互选项。
-- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用方向键菜单选择要更新的 JSON。
-- `monitor`：通过 Livox-SDK2 显示单屏实时仪表盘，适合长时间观察。
+- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用带颜色的方向键菜单选择要更新的 JSON。
+- `monitor`：先通过 SDK 发现雷达，再显示单屏实时仪表盘，适合长时间观察。
 - `dump`：通过 Livox-SDK2 把短时间点云/IMU 样本解析到 CSV。
 
 需要请求雷达进入 normal mode 并开启数据发送时，再显式加控制参数：
@@ -113,7 +113,13 @@ source ./env.sh
 config/MID360_config.local.json
 ```
 
-`autoconfig` 会自动搜索当前目录和用户目录下的 MID360 配置文件，使用上下方向键移动，空格选择/取消，回车确认，`q` 或 `Esc` 退出不修改。`monitor` 和 `dump` 会优先使用 `LIVOX_MID360_CONFIG` 指向的配置文件，你通常不需要手动传 `--config`。
+`autoconfig` 会自动搜索当前目录和用户目录下的 MID360 配置文件，默认按“推荐更新 / 已匹配 / 其它候选”分组显示，并折叠示例、依赖和构建产物里的低优先级配置。使用上下方向键移动，空格选择/取消，`a` 显示或隐藏低优先级候选，回车确认，`q` 或 `Esc` 退出不修改。需要默认展示所有候选时可加 `--show-all`；需要纯文本输出时可加 `--no-color` 或设置 `NO_COLOR=1`。`dump` 会优先使用 `LIVOX_MID360_CONFIG` 指向的配置文件，你通常不需要手动传 `--config`。
+
+C++ `monitor` 默认不再使用配置文件里的雷达 IP；它会先走 Livox-SDK2 发现，找到雷达后实时监听回调。如果多块网卡需要指定扫描网卡，可以使用：
+
+```bash
+./build/sdk2/livox_mid360_diagnostics monitor --iface eth0
+```
 
 如果要手动指定配置：
 
@@ -127,7 +133,7 @@ export LIVOX_MID360_CONFIG="/absolute/path/to/MID360_config.json"
 
 Python `udp-monitor` 在终端显示 UDP 包速率和点数估计。它只监听本机端口，不控制雷达。
 
-C++ `monitor` 显示表格仪表盘，并在原位置刷新，不会持续刷出新行。`Link` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`Health` 表示雷达上报的诊断码。
+C++ `monitor` 先发现雷达，再显示表格仪表盘，并在原位置刷新，不会持续刷出新行。通过非交互 SSH 或日志管道运行时，`monitor` 会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
 
 C++ `dump` 输出短时采样 CSV。MID360 点云数据量较大，CSV 是文本格式，不适合长期记录；长期观察请用 `monitor`。
 
@@ -191,7 +197,7 @@ livox-mid360-diagnostics-cpp-1.0.0-linux-aarch64.tar.gz
 
 - 没有接入健康雷达前，不要运行带 `--set-normal-mode --enable-point-send --enable-imu` 的命令。
 - Python `udp-monitor` 只监听本机 UDP 端口。
-- C++ `monitor` 和 `dump` 会初始化 Livox-SDK2；只有显式加控制参数时才请求雷达切换模式或开启数据发送。
+- C++ `monitor` 和 `dump` 会初始化 Livox-SDK2；`monitor` 默认通过 SDK discovery 发现雷达，不读取 env 中的雷达 IP；只有显式加控制参数时才请求雷达切换模式或开启数据发送。
 - `external/livox_ros_driver2` 只是源码 submodule，不等于已经构建好的 ROS 工作区。
 
 ## 更多文档

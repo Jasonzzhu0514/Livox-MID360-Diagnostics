@@ -284,6 +284,125 @@ def resolve_config_paths(raw_paths: list[str] | None, verbose: bool = False) -> 
     return [default_config_path()]
 
 
+def should_enable_color(no_color: bool = False) -> bool:
+    return (
+        not no_color
+        and sys.stdout.isatty()
+        and not os.environ.get("NO_COLOR")
+        and os.environ.get("TERM", "") != "dumb"
+    )
+
+
+def init_theme(no_color: bool = False) -> None:
+    global THEME
+    if not should_enable_color(no_color):
+        THEME = Theme()
+        return
+    THEME = Theme(
+        enabled=True,
+        reset="\033[0m",
+        bold="\033[1m",
+        dim="\033[2m",
+        red="\033[31m",
+        green="\033[32m",
+        yellow="\033[33m",
+        blue="\033[34m",
+        cyan="\033[36m",
+    )
+
+
+def colorize(text: str, color: str) -> str:
+    if not THEME.enabled or not color:
+        return text
+    return f"{color}{text}{THEME.reset}"
+
+
+def bold(text: str) -> str:
+    return colorize(text, THEME.bold)
+
+
+def dim(text: str) -> str:
+    return colorize(text, THEME.dim)
+
+
+def green(text: str) -> str:
+    return colorize(text, THEME.green)
+
+
+def yellow(text: str) -> str:
+    return colorize(text, THEME.yellow)
+
+
+def red(text: str) -> str:
+    return colorize(text, THEME.red)
+
+
+def blue(text: str) -> str:
+    return colorize(text, THEME.blue)
+
+
+def cyan(text: str) -> str:
+    return colorize(text, THEME.cyan)
+
+
+def status_label(status: str) -> str:
+    if status == "mismatch":
+        return yellow(status)
+    if status == "match":
+        return green(status)
+    if status == "unavailable":
+        return dim(status)
+    return status
+
+
+def path_display(path: Path) -> str:
+    try:
+        absolute = path.resolve()
+    except OSError:
+        absolute = path
+    try:
+        cwd = Path.cwd().resolve()
+        return str(absolute.relative_to(cwd))
+    except (OSError, ValueError):
+        pass
+    try:
+        home = Path.home().resolve()
+        return "~/" + str(absolute.relative_to(home))
+    except (OSError, ValueError):
+        return str(path)
+
+
+def compact_path(path: Path, max_width: int = 76) -> str:
+    display = path_display(path)
+    if len(display) <= max_width:
+        return display
+    if max_width <= 10:
+        return display[:max_width]
+    return ".../" + display[-(max_width - 4) :]
+
+
+def is_low_priority_config_path(path: Path) -> bool:
+    lowered = path_display(path).lower()
+    return (
+        "/external/" in lowered
+        or lowered.startswith("external/")
+        or "/samples/" in lowered
+        or lowered.startswith("samples/")
+        or "/thirdparty/" in lowered
+        or lowered.startswith("thirdparty/")
+        or "/3rdparty/" in lowered
+        or lowered.startswith("3rdparty/")
+        or "/.runtime/" in lowered
+        or lowered.startswith(".runtime/")
+        or "/examples/" in lowered
+        or lowered.startswith("examples/")
+        or "/build/" in lowered
+        or lowered.startswith("build/")
+        or "/dist/" in lowered
+        or lowered.startswith("dist/")
+    )
+
+
 @dataclass
 class Discovery:
     lidar_ip: str | None = None
@@ -292,6 +411,39 @@ class Discovery:
     iface_ip: str | None = None
     raw_packets: int = 0
     method: str = ""
+
+
+@dataclass
+class ConfigState:
+    path: Path
+    configured_ip: str | None
+    status: str
+    low_priority: bool = False
+    original_index: int = 0
+
+
+@dataclass
+class ConfigView:
+    recommended: list[ConfigState]
+    matched: list[ConfigState]
+    other: list[ConfigState]
+    hidden_count: int = 0
+
+
+@dataclass
+class Theme:
+    enabled: bool = False
+    reset: str = ""
+    bold: str = ""
+    dim: str = ""
+    red: str = ""
+    green: str = ""
+    yellow: str = ""
+    blue: str = ""
+    cyan: str = ""
+
+
+THEME = Theme()
 
 
 def append_method(method: str, suffix: str) -> str:
@@ -386,13 +538,13 @@ def verbose_print(enabled: bool, message: str) -> None:
 
 
 def progress(message: str) -> None:
-    line = f"[scan] {message}"
+    line = f"{cyan('扫描')} {message}"
     if SCREEN_ACTIVE:
         SCAN_LINES.append(line)
         del SCAN_LINES[:-8]
         print("\033[H\033[2J", end="")
-        print("Livox MID360 Autoconfig")
-        print("=======================\n")
+        print(bold(blue("Livox MID360 Autoconfig")))
+        print(dim("=======================") + "\n")
         for item in SCAN_LINES:
             print(item)
         sys.stdout.flush()
@@ -1003,21 +1155,77 @@ def parse_selection(answer: str, count: int) -> list[int]:
     return sorted(selected)
 
 
-def print_config_table(config_states: list[tuple[Path, str | None, str]]) -> None:
-    print("\n可更新的 MID360 配置文件：")
+def make_config_view(config_states: list[ConfigState], show_all: bool) -> ConfigView:
+    view = ConfigView(recommended=[], matched=[], other=[])
+    has_normal_priority = any(not state.low_priority for state in config_states)
+    for state in config_states:
+        if state.low_priority and not show_all and has_normal_priority:
+            view.hidden_count += 1
+            continue
+        if state.status == "mismatch":
+            view.recommended.append(state)
+        elif state.status == "match":
+            view.matched.append(state)
+        else:
+            view.other.append(state)
+    return view
+
+
+def flatten_config_view(view: ConfigView) -> list[ConfigState]:
+    return [*view.recommended, *view.matched, *view.other]
+
+
+def print_config_entry(index: int, state: ConfigState, cursor: bool = False, checked: bool = False) -> None:
+    pointer = cyan("> ") if cursor else "  "
+    marker = green("x") if checked else " "
+    print(f"{pointer}[{marker}] [{index}] {compact_path(state.path)}")
+    low_priority = f"  {dim('sample/low-priority')}" if state.low_priority else ""
+    print(f"      current={state.configured_ip or dim('N/A')}  status={status_label(state.status)}{low_priority}")
+
+
+def print_config_section(
+    title: str,
+    states: list[ConfigState],
+    start_index: int,
+    cursor: int | None = None,
+    selected: list[bool] | None = None,
+) -> int:
+    if not states:
+        return start_index
+    print(f"\n{bold(title)}")
+    index = start_index
+    for state in states:
+        checked = bool(selected and state.original_index < len(selected) and selected[state.original_index])
+        print_config_entry(index + 1, state, cursor=index == cursor, checked=checked)
+        index += 1
+    return index
+
+
+def print_hidden_hint(hidden_count: int) -> None:
+    if hidden_count:
+        print(f"\n{dim(f'其它低优先级候选已折叠: {hidden_count} 个，按 a 显示全部。')}")
+
+
+def print_config_table(config_states: list[ConfigState], show_all: bool = False) -> None:
+    print(f"\n{bold('可更新的 MID360 配置文件')}")
     if not config_states:
         print("  未发现带有雷达 IP 的配置文件。")
         return
-    for index, (path, configured_ip, status) in enumerate(config_states, start=1):
-        print(f"  [{index}] {path}")
-        print(f"      current={configured_ip or 'N/A'}  status={status}")
+    view = make_config_view(config_states, show_all)
+    index = 0
+    index = print_config_section("推荐更新", view.recommended, index)
+    index = print_config_section("已匹配", view.matched, index)
+    index = print_config_section("其它候选", view.other, index)
+    if index == 0:
+        print("  当前可见列表为空。")
+    print_hidden_hint(view.hidden_count)
 
 
 def print_detection_summary(iface: str, result: Discovery) -> None:
-    print("检测结果")
-    print(f"  iface:           {iface}")
+    print(bold("检测结果"))
+    print(f"  iface:           {cyan(iface)}")
     print(f"  iface_ip:        {result.iface_ip or 'N/A'}")
-    print(f"  lidar_ip:        {result.lidar_ip or 'N/A'}")
+    print(f"  lidar_ip:        {green(result.lidar_ip) if result.lidar_ip else red('N/A')}")
     print(f"  broadcast_code:  {result.broadcast_code or 'N/A'}")
     print(f"  arp_host_ip:     {result.requested_host_ip or 'N/A'}")
     print(f"  discovery_pkts:  {result.raw_packets}")
@@ -1043,43 +1251,57 @@ def leave_screen() -> None:
 
 
 def choose_configs_interactively(
-    config_states: list[tuple[Path, str | None, str]],
+    config_states: list[ConfigState],
     iface: str,
     result: Discovery,
+    initial_show_all: bool = False,
 ) -> list[int]:
     if not config_states:
         if SCREEN_ACTIVE:
             print("\033[H\033[2J", end="")
-            print("Livox MID360 Autoconfig")
-            print("=======================\n")
+            print(bold(blue("Livox MID360 Autoconfig")))
+            print(dim("=======================") + "\n")
             print_detection_summary(iface, result)
             print("\n可更新的 MID360 配置文件：")
             print("  未发现带有雷达 IP 的配置文件。")
         else:
             print_detection_summary(iface, result)
-            print_config_table(config_states)
+            print_config_table(config_states, initial_show_all)
         return []
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print_detection_summary(iface, result)
-        print_config_table(config_states)
+        print_config_table(config_states, initial_show_all)
         return []
 
-    selected = [False] * len(config_states)
+    selected = [False] * (max((state.original_index for state in config_states), default=-1) + 1)
+    show_all = initial_show_all
+    visible_states = flatten_config_view(make_config_view(config_states, show_all))
     cursor = 0
 
     def redraw() -> None:
+        nonlocal cursor, visible_states
+        visible_states = flatten_config_view(make_config_view(config_states, show_all))
+        if not visible_states:
+            cursor = 0
+        elif cursor >= len(visible_states):
+            cursor = len(visible_states) - 1
         print("\033[H\033[2J", end="")
-        print("Livox MID360 Autoconfig")
-        print("=======================\n")
+        print(bold(blue("Livox MID360 Autoconfig")))
+        print(dim("=======================") + "\n")
         print_detection_summary(iface, result)
-        print("\n选择要更新的 MID360 配置文件")
-        print("上下方向键移动，空格选择/取消，回车确认，q 或 Esc 退出不修改。\n")
-        for index, (path, configured_ip, status) in enumerate(config_states):
-            pointer = ">" if index == cursor else " "
-            marker = "x" if selected[index] else " "
-            print(f"{pointer} [{marker}] {path}")
-            print(f"    current={configured_ip}  status={status}")
+        print(f"\n{bold('选择要更新的 MID360 配置文件')}")
+        print(dim("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。"))
+        view = make_config_view(config_states, show_all)
+        index = 0
+        index = print_config_section("推荐更新", view.recommended, index, cursor, selected)
+        index = print_config_section("已匹配", view.matched, index, cursor, selected)
+        index = print_config_section("其它候选", view.other, index, cursor, selected)
+        if index == 0:
+            print("\n  当前可见列表为空。")
+        print_hidden_hint(view.hidden_count)
+        if visible_states:
+            print(f"\n{dim('完整路径: ' + str(visible_states[cursor].path))}")
         sys.stdout.flush()
 
     def read_char(timeout: float | None = None) -> str:
@@ -1100,16 +1322,23 @@ def choose_configs_interactively(
                 left = read_char(0.05)
                 right = read_char(0.05)
                 if left == "[" and right == "A":
-                    cursor = len(config_states) - 1 if cursor == 0 else cursor - 1
+                    if visible_states:
+                        cursor = len(visible_states) - 1 if cursor == 0 else cursor - 1
                 elif left == "[" and right == "B":
-                    cursor = (cursor + 1) % len(config_states)
+                    if visible_states:
+                        cursor = (cursor + 1) % len(visible_states)
                 else:
                     cancelled = True
                     break
             elif ch == " ":
-                selected[cursor] = not selected[cursor]
+                if visible_states:
+                    original_index = visible_states[cursor].original_index
+                    if original_index < len(selected):
+                        selected[original_index] = not selected[original_index]
             elif ch in ("\n", "\r"):
                 break
+            elif ch in ("a", "A"):
+                show_all = not show_all
             elif ch in ("q", "Q"):
                 cancelled = True
                 break
@@ -1182,7 +1411,10 @@ def main() -> int:
         action="store_true",
         help="return non-zero when detected lidar IP differs from configured lidar IP",
     )
+    parser.add_argument("--show-all", action="store_true", help="include sample/build/dist config candidates in the picker")
+    parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args()
+    init_theme(args.no_color)
     interactive_picker = not args.apply and sys.stdin.isatty() and sys.stdout.isatty()
     if interactive_picker:
         enter_screen()
@@ -1236,8 +1468,8 @@ def main() -> int:
 
     needs_update = False
     unavailable = False
-    config_states = []
-    for path in config_paths:
+    config_states: list[ConfigState] = []
+    for index, path in enumerate(config_paths):
         configured_ip = read_config_lidar_ip(path)
         status = ""
         if configured_ip and configured_ip != result.lidar_ip:
@@ -1248,42 +1480,54 @@ def main() -> int:
         else:
             unavailable = True
             status = "unavailable"
-        config_states.append((path, configured_ip, status))
+        config_states.append(
+            ConfigState(
+                path=path,
+                configured_ip=configured_ip,
+                status=status,
+                low_priority=is_low_priority_config_path(path),
+                original_index=index,
+            )
+        )
 
     updated_any = False
     if args.apply:
-        for path, configured_ip, _status in config_states:
-            if not path.is_file():
-                print(f"ERROR: config file not found: {path}", file=sys.stderr)
+        for state in config_states:
+            if not state.path.is_file():
+                print(f"ERROR: config file not found: {state.path}", file=sys.stderr)
                 return 2
-            if configured_ip == result.lidar_ip:
+            if state.configured_ip == result.lidar_ip:
                 continue
             should_update = args.yes or not sys.stdin.isatty()
             if not should_update:
-                should_update = confirm_update(path, configured_ip, result.lidar_ip, False)
+                should_update = confirm_update(state.path, state.configured_ip, result.lidar_ip, False)
             if should_update:
-                update_config(path, result.lidar_ip, result.iface_ip)
+                update_config(state.path, result.lidar_ip, result.iface_ip)
                 updated_any = True
             else:
-                print(f"skipped: {path}")
+                print(f"skipped: {state.path}")
     elif sys.stdin.isatty():
-        visible_config_states = [state for state in config_states if state[1]]
-        selected = choose_configs_interactively(visible_config_states, iface, result)
+        visible_config_states = [state for state in config_states if state.configured_ip] or config_states
+        selected = choose_configs_interactively(visible_config_states, iface, result, args.show_all)
         if not selected:
             leave_screen()
             print("未选择配置文件，退出不修改。")
         for index in selected:
-            path, _configured_ip, _status = visible_config_states[index]
-            if not path.is_file():
+            state = next((item for item in config_states if item.original_index == index), None)
+            if state is None:
                 leave_screen()
-                print(f"ERROR: config file not found: {path}", file=sys.stderr)
+                print(f"ERROR: invalid config selection index: {index}", file=sys.stderr)
                 return 2
-            update_config(path, result.lidar_ip, result.iface_ip)
+            if not state.path.is_file():
+                leave_screen()
+                print(f"ERROR: config file not found: {state.path}", file=sys.stderr)
+                return 2
+            update_config(state.path, result.lidar_ip, result.iface_ip)
             leave_screen()
             updated_any = True
     else:
-        visible_config_states = [state for state in config_states if state[1]]
-        print_config_table(visible_config_states)
+        visible_config_states = [state for state in config_states if state.configured_ip]
+        print_config_table(visible_config_states, args.show_all)
         print("非交互式终端不会修改配置；需要自动写入时请显式使用 --config PATH --apply --yes。")
 
     if args.require_match and (needs_update or unavailable) and not updated_any:

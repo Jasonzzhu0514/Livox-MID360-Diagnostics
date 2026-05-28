@@ -25,6 +25,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <limits>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -48,6 +49,8 @@ struct Options {
   bool no_sudo = false;
   bool verbose = false;
   bool require_match = false;
+  bool show_all = false;
+  bool no_color = false;
   std::vector<std::string> configs;
 };
 
@@ -69,11 +72,33 @@ struct ConfigState {
   std::string path;
   std::string configured_ip;
   std::string status;
+  bool low_priority = false;
+  size_t original_index = 0;
+};
+
+struct ConfigView {
+  std::vector<ConfigState> recommended;
+  std::vector<ConfigState> matched;
+  std::vector<ConfigState> other;
+  size_t hidden_count = 0;
+};
+
+struct Theme {
+  bool enabled = false;
+  std::string reset;
+  std::string bold;
+  std::string dim;
+  std::string red;
+  std::string green;
+  std::string yellow;
+  std::string blue;
+  std::string cyan;
 };
 
 const std::array<const char*, 2> kMid360ConfigKeys = {"MID360", "Mid360s"};
 bool g_screen_active = false;
 std::vector<std::string> g_scan_lines;
+Theme g_theme;
 
 std::string home_dir() {
   const char* home = std::getenv("HOME");
@@ -106,6 +131,133 @@ std::string real_path_or_self(const std::string& path) {
     return buffer;
   }
   return path;
+}
+
+bool should_enable_color(bool no_color) {
+  if (no_color || !isatty(STDOUT_FILENO)) {
+    return false;
+  }
+  const char* no_color_env = std::getenv("NO_COLOR");
+  if (no_color_env && std::strlen(no_color_env) > 0) {
+    return false;
+  }
+  const char* term = std::getenv("TERM");
+  return term && std::strcmp(term, "dumb") != 0;
+}
+
+void init_theme(bool no_color) {
+  if (!should_enable_color(no_color)) {
+    g_theme = Theme{};
+    return;
+  }
+  g_theme.enabled = true;
+  g_theme.reset = "\033[0m";
+  g_theme.bold = "\033[1m";
+  g_theme.dim = "\033[2m";
+  g_theme.red = "\033[31m";
+  g_theme.green = "\033[32m";
+  g_theme.yellow = "\033[33m";
+  g_theme.blue = "\033[34m";
+  g_theme.cyan = "\033[36m";
+}
+
+std::string colorize(const std::string& text, const std::string& color) {
+  if (!g_theme.enabled || color.empty()) {
+    return text;
+  }
+  return color + text + g_theme.reset;
+}
+
+std::string bold(const std::string& text) {
+  return colorize(text, g_theme.bold);
+}
+
+std::string dim(const std::string& text) {
+  return colorize(text, g_theme.dim);
+}
+
+std::string green(const std::string& text) {
+  return colorize(text, g_theme.green);
+}
+
+std::string yellow(const std::string& text) {
+  return colorize(text, g_theme.yellow);
+}
+
+std::string red(const std::string& text) {
+  return colorize(text, g_theme.red);
+}
+
+std::string blue(const std::string& text) {
+  return colorize(text, g_theme.blue);
+}
+
+std::string cyan(const std::string& text) {
+  return colorize(text, g_theme.cyan);
+}
+
+std::string status_label(const std::string& status) {
+  if (status == "mismatch") {
+    return yellow(status);
+  }
+  if (status == "match") {
+    return green(status);
+  }
+  if (status == "unavailable") {
+    return dim(status);
+  }
+  return status;
+}
+
+std::string path_display(const std::string& path) {
+  const std::string absolute = real_path_or_self(path);
+  const std::string cwd = real_path_or_self(".");
+  const std::string home = real_path_or_self(home_dir());
+  if (absolute == cwd) {
+    return ".";
+  }
+  if (absolute.rfind(cwd + "/", 0) == 0) {
+    return absolute.substr(cwd.size() + 1);
+  }
+  if (!home.empty() && absolute == home) {
+    return "~";
+  }
+  if (!home.empty() && absolute.rfind(home + "/", 0) == 0) {
+    return "~/" + absolute.substr(home.size() + 1);
+  }
+  return path;
+}
+
+std::string compact_path(const std::string& path, size_t max_width = 76) {
+  const std::string display = path_display(path);
+  if (display.size() <= max_width) {
+    return display;
+  }
+  if (max_width <= 10) {
+    return display.substr(0, max_width);
+  }
+  const size_t tail_width = max_width - 4;
+  return ".../" + display.substr(display.size() - tail_width);
+}
+
+bool is_low_priority_config_path(const std::string& path) {
+  const std::string lower = lower_copy(path_display(path));
+  return lower.find("/external/") != std::string::npos ||
+         lower.rfind("external/", 0) == 0 ||
+         lower.find("/samples/") != std::string::npos ||
+         lower.rfind("samples/", 0) == 0 ||
+         lower.find("/thirdparty/") != std::string::npos ||
+         lower.rfind("thirdparty/", 0) == 0 ||
+         lower.find("/3rdparty/") != std::string::npos ||
+         lower.rfind("3rdparty/", 0) == 0 ||
+         lower.find("/.runtime/") != std::string::npos ||
+         lower.rfind(".runtime/", 0) == 0 ||
+         lower.find("/examples/") != std::string::npos ||
+         lower.rfind("examples/", 0) == 0 ||
+         lower.find("/build/") != std::string::npos ||
+         lower.rfind("build/", 0) == 0 ||
+         lower.find("/dist/") != std::string::npos ||
+         lower.rfind("dist/", 0) == 0;
 }
 
 std::vector<std::string> split_paths(const std::string& value) {
@@ -198,15 +350,15 @@ void debug(const Options& options, const std::string& message) {
 }
 
 void progress(const std::string& message) {
-  const std::string line = "[scan] " + message;
+  const std::string line = cyan("扫描") + " " + message;
   if (g_screen_active) {
     g_scan_lines.push_back(line);
     if (g_scan_lines.size() > 8) {
       g_scan_lines.erase(g_scan_lines.begin());
     }
     std::cout << "\033[H\033[2J";
-    std::cout << "Livox MID360 Autoconfig\n";
-    std::cout << "=======================\n\n";
+    std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
+    std::cout << dim("=======================") << "\n\n";
     for (const auto& item : g_scan_lines) {
       std::cout << item << "\n";
     }
@@ -894,18 +1046,111 @@ std::vector<size_t> parse_selection(const std::string& answer, size_t count) {
   return selected;
 }
 
-void print_config_table(const std::vector<ConfigState>& states) {
-  std::cout << "\n可更新的 MID360 配置文件：\n";
+ConfigView make_config_view(const std::vector<ConfigState>& states, bool show_all) {
+  ConfigView view;
+  const bool has_normal_priority = std::any_of(states.begin(), states.end(), [](const ConfigState& state) {
+    return !state.low_priority;
+  });
+  for (const auto& state : states) {
+    if (state.low_priority && !show_all && has_normal_priority) {
+      view.hidden_count += 1;
+      continue;
+    }
+    if (state.status == "mismatch") {
+      view.recommended.push_back(state);
+    } else if (state.status == "match") {
+      view.matched.push_back(state);
+    } else {
+      view.other.push_back(state);
+    }
+  }
+  return view;
+}
+
+std::vector<ConfigState> flatten_config_view(const ConfigView& view) {
+  std::vector<ConfigState> out;
+  out.insert(out.end(), view.recommended.begin(), view.recommended.end());
+  out.insert(out.end(), view.matched.begin(), view.matched.end());
+  out.insert(out.end(), view.other.begin(), view.other.end());
+  return out;
+}
+
+size_t checked_size_for_states(const std::vector<ConfigState>& states) {
+  size_t size = states.size();
+  for (const auto& state : states) {
+    size = std::max(size, state.original_index + 1);
+  }
+  return size;
+}
+
+std::vector<size_t> map_visible_selection_to_original(
+    const std::vector<ConfigState>& states,
+    const std::vector<size_t>& selected) {
+  std::vector<size_t> out;
+  out.reserve(selected.size());
+  for (size_t index : selected) {
+    if (index >= states.size()) {
+      throw std::runtime_error("selection out of range: " + std::to_string(index + 1));
+    }
+    out.push_back(states[index].original_index);
+  }
+  return out;
+}
+
+void print_config_entry(size_t index, const ConfigState& state, bool cursor, bool checked) {
+  std::cout << (cursor ? cyan("> ") : "  ")
+            << "[" << (checked ? green("x") : " ") << "] "
+            << "[" << index << "] " << compact_path(state.path) << "\n"
+            << "      current=" << (state.configured_ip.empty() ? dim("N/A") : state.configured_ip)
+            << "  status=" << status_label(state.status);
+  if (state.low_priority) {
+    std::cout << "  " << dim("sample/low-priority");
+  }
+  std::cout << "\n";
+}
+
+void print_config_section(
+    const std::string& title,
+    const std::vector<ConfigState>& states,
+    size_t& index,
+    size_t cursor,
+    const std::vector<bool>* checked) {
+  if (states.empty()) {
+    return;
+  }
+  std::cout << "\n" << bold(title) << "\n";
+  for (const auto& state : states) {
+    const bool is_cursor = index == cursor;
+    const bool is_checked = checked &&
+        state.original_index < checked->size() &&
+        (*checked)[state.original_index];
+    print_config_entry(index + 1, state, is_cursor, is_checked);
+    index += 1;
+  }
+}
+
+void print_hidden_hint(size_t hidden_count) {
+  if (hidden_count == 0) {
+    return;
+  }
+  std::cout << "\n" << dim("其它低优先级候选已折叠: " + std::to_string(hidden_count) + " 个，按 a 显示全部。") << "\n";
+}
+
+void print_config_table(const std::vector<ConfigState>& states, bool show_all = false) {
+  std::cout << "\n" << bold("可更新的 MID360 配置文件") << "\n";
   if (states.empty()) {
     std::cout << "  未发现带有雷达 IP 的配置文件。\n";
     return;
   }
-  for (size_t i = 0; i < states.size(); ++i) {
-    const auto& state = states[i];
-    std::cout << "  [" << (i + 1) << "] " << state.path << "\n"
-              << "      current=" << (state.configured_ip.empty() ? "N/A" : state.configured_ip)
-              << "  status=" << state.status << "\n";
+  const ConfigView view = make_config_view(states, show_all);
+  size_t index = 0;
+  print_config_section("推荐更新", view.recommended, index, std::numeric_limits<size_t>::max(), nullptr);
+  print_config_section("已匹配", view.matched, index, std::numeric_limits<size_t>::max(), nullptr);
+  print_config_section("其它候选", view.other, index, std::numeric_limits<size_t>::max(), nullptr);
+  if (index == 0) {
+    std::cout << "  当前可见列表为空。\n";
   }
+  print_hidden_hint(view.hidden_count);
 }
 
 struct DetectionSummary {
@@ -915,10 +1160,10 @@ struct DetectionSummary {
 
 void print_detection_summary(const DetectionSummary& summary) {
   const auto& result = summary.result;
-  std::cout << "检测结果\n";
-  std::cout << "  iface:           " << summary.iface << "\n";
+  std::cout << bold("检测结果") << "\n";
+  std::cout << "  iface:           " << cyan(summary.iface) << "\n";
   std::cout << "  iface_ip:        " << (result.iface_ip.empty() ? "N/A" : result.iface_ip) << "\n";
-  std::cout << "  lidar_ip:        " << (result.lidar_ip.empty() ? "N/A" : result.lidar_ip) << "\n";
+  std::cout << "  lidar_ip:        " << (result.lidar_ip.empty() ? red("N/A") : green(result.lidar_ip)) << "\n";
   std::cout << "  broadcast_code:  N/A\n";
   std::cout << "  arp_host_ip:     " << (result.requested_host_ip.empty() ? "N/A" : result.requested_host_ip) << "\n";
   std::cout << "  discovery_pkts:  " << result.raw_packets << "\n";
@@ -941,17 +1186,20 @@ void leave_screen() {
   std::cout << "\033[?25h\033[?1049l" << std::flush;
 }
 
-std::vector<size_t> choose_configs_interactively(const std::vector<ConfigState>& states, const DetectionSummary& summary) {
+std::vector<size_t> choose_configs_interactively(
+    const std::vector<ConfigState>& states,
+    const DetectionSummary& summary,
+    bool initial_show_all) {
   if (states.empty()) {
     if (g_screen_active) {
       std::cout << "\033[H\033[2J";
-      std::cout << "Livox MID360 Autoconfig\n";
-      std::cout << "=======================\n\n";
+      std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
+      std::cout << dim("=======================") << "\n\n";
       print_detection_summary(summary);
       std::cout << "\n可更新的 MID360 配置文件：\n  未发现带有雷达 IP 的配置文件。\n";
     } else {
       print_detection_summary(summary);
-      print_config_table(states);
+      print_config_table(states, initial_show_all);
     }
     return {};
   }
@@ -959,42 +1207,59 @@ std::vector<size_t> choose_configs_interactively(const std::vector<ConfigState>&
   termios original {};
   if (tcgetattr(STDIN_FILENO, &original) != 0) {
     print_detection_summary(summary);
-    print_config_table(states);
+    print_config_table(states, initial_show_all);
     std::cout << "\n输入要修改的编号，支持空格/逗号/范围，例如: 1 3 或 1-3；输入 all 全选；直接回车退出不修改。\n";
     std::cout << "选择: ";
     std::string answer;
     std::getline(std::cin, answer);
     answer = trim(answer);
-    return answer.empty() ? std::vector<size_t>{} : parse_selection(answer, states.size());
+    if (answer.empty()) {
+      return {};
+    }
+    return map_visible_selection_to_original(states, parse_selection(answer, states.size()));
   }
   termios raw = original;
   raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
   raw.c_cc[VMIN] = 1;
   raw.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
-    print_config_table(states);
+    print_config_table(states, initial_show_all);
     return {};
   }
 
   size_t cursor = 0;
-  std::vector<bool> checked(states.size(), false);
+  bool show_all = initial_show_all;
+  std::vector<ConfigState> visible_states = flatten_config_view(make_config_view(states, show_all));
+  std::vector<bool> checked(checked_size_for_states(states), false);
   bool done = false;
   bool cancelled = false;
 
   auto redraw = [&]() {
+    visible_states = flatten_config_view(make_config_view(states, show_all));
+    if (visible_states.empty()) {
+      cursor = 0;
+    } else if (cursor >= visible_states.size()) {
+      cursor = visible_states.size() - 1;
+    }
     std::cout << "\033[H\033[2J";
-    std::cout << "Livox MID360 Autoconfig\n";
-    std::cout << "=======================\n\n";
+    std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
+    std::cout << dim("=======================") << "\n\n";
     print_detection_summary(summary);
-    std::cout << "\n选择要更新的 MID360 配置文件\n";
-    std::cout << "上下方向键移动，空格选择/取消，回车确认，q 或 Esc 退出不修改。\n\n";
-    for (size_t i = 0; i < states.size(); ++i) {
-      const auto& state = states[i];
-      std::cout << (i == cursor ? "> " : "  ")
-                << "[" << (checked[i] ? "x" : " ") << "] "
-                << state.path << "\n"
-                << "    current=" << state.configured_ip
-                << "  status=" << state.status << "\n";
+    std::cout << "\n" << bold("选择要更新的 MID360 配置文件") << "\n";
+    std::cout << dim("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。") << "\n";
+
+    const ConfigView view = make_config_view(states, show_all);
+    size_t offset = 0;
+    print_config_section("推荐更新", view.recommended, offset, cursor, &checked);
+    print_config_section("已匹配", view.matched, offset, cursor, &checked);
+    print_config_section("其它候选", view.other, offset, cursor, &checked);
+    if (offset == 0) {
+      std::cout << "\n  当前可见列表为空。\n";
+    }
+    print_hidden_hint(view.hidden_count);
+    if (!visible_states.empty()) {
+      const auto& state = visible_states[cursor];
+      std::cout << "\n" << dim("完整路径: " + state.path) << "\n";
     }
     std::cout.flush();
   };
@@ -1021,18 +1286,29 @@ std::vector<size_t> choose_configs_interactively(const std::vector<ConfigState>&
       char right = 0;
       if (read_char_timeout(left, 50) && read_char_timeout(right, 50) && left == '[') {
         if (right == 'A') {
-          cursor = cursor == 0 ? states.size() - 1 : cursor - 1;
+          if (!visible_states.empty()) {
+            cursor = cursor == 0 ? visible_states.size() - 1 : cursor - 1;
+          }
         } else if (right == 'B') {
-          cursor = (cursor + 1) % states.size();
+          if (!visible_states.empty()) {
+            cursor = (cursor + 1) % visible_states.size();
+          }
         }
       } else {
         cancelled = true;
         done = true;
       }
     } else if (ch == ' ') {
-      checked[cursor] = !checked[cursor];
+      if (!visible_states.empty()) {
+        const size_t original_index = visible_states[cursor].original_index;
+        if (original_index < checked.size()) {
+          checked[original_index] = !checked[original_index];
+        }
+      }
     } else if (ch == '\n' || ch == '\r') {
       done = true;
+    } else if (ch == 'a' || ch == 'A') {
+      show_all = !show_all;
     } else if (ch == 'q' || ch == 'Q') {
       cancelled = true;
       done = true;
@@ -1069,6 +1345,8 @@ void usage(const char* argv0) {
       << "  --apply                 update config files without the interactive picker\n"
       << "  --yes                   do not prompt when used with --apply\n"
       << "  --require-match         return non-zero if config is unavailable/mismatched\n"
+      << "  --show-all              include sample/build/dist config candidates in the picker\n"
+      << "  --no-color              disable ANSI colors\n"
       << "  --no-sudo               do not prefix tcpdump with sudo\n"
       << "  -v, --verbose           print debug output\n"
       << "  -h, --help              show this help\n";
@@ -1103,6 +1381,10 @@ Options parse_args(int argc, char** argv) {
       options.verbose = true;
     } else if (arg == "--require-match") {
       options.require_match = true;
+    } else if (arg == "--show-all") {
+      options.show_all = true;
+    } else if (arg == "--no-color") {
+      options.no_color = true;
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }
@@ -1115,6 +1397,7 @@ Options parse_args(int argc, char** argv) {
 int main(int argc, char** argv) {
   try {
     const Options options = parse_args(argc, argv);
+    init_theme(options.no_color);
     const bool interactive_picker = !options.apply && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     if (interactive_picker) {
       enter_screen();
@@ -1157,7 +1440,7 @@ int main(int argc, char** argv) {
         unavailable = true;
         status = "unavailable";
       }
-      states.push_back({path, configured_ip, status});
+      states.push_back({path, configured_ip, status, is_low_priority_config_path(path), states.size()});
     }
 
     bool updated_any = false;
@@ -1196,13 +1479,24 @@ int main(int argc, char** argv) {
           visible_states.push_back(state);
         }
       }
-      const std::vector<size_t> selected = choose_configs_interactively(visible_states, summary);
+      if (visible_states.empty()) {
+        visible_states = states;
+      }
+      const std::vector<size_t> selected = choose_configs_interactively(visible_states, summary, options.show_all);
       if (selected.empty()) {
         leave_screen();
         std::cout << "未选择配置文件，退出不修改。\n";
       }
       for (size_t index : selected) {
-        const auto& state = visible_states[index];
+        const auto found = std::find_if(states.begin(), states.end(), [&](const ConfigState& state) {
+          return state.original_index == index;
+        });
+        if (found == states.end()) {
+          leave_screen();
+          std::cerr << "ERROR: invalid config selection index: " << index << "\n";
+          return 2;
+        }
+        const auto& state = *found;
         if (!regular_file_exists(state.path)) {
           leave_screen();
           std::cerr << "ERROR: config file not found: " << state.path << "\n";
@@ -1224,7 +1518,7 @@ int main(int argc, char** argv) {
           visible_states.push_back(state);
         }
       }
-      print_config_table(visible_states);
+      print_config_table(visible_states, options.show_all);
       std::cout << "非交互式终端不会修改配置；需要自动写入时请显式使用 --config PATH --apply --yes。\n";
     }
 

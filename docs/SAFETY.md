@@ -11,7 +11,7 @@
 
 - `livox-mid360-diagnostics autoconfig` 和 `mid360_config_tool` 运行时会执行网络发现；交互选择配置文件或显式使用 `--apply` 时才会更新文件。
 - `livox-mid360-diagnostics udp-monitor` 只绑定本机 UDP 端口并观察收到的数据包，不会向雷达发送命令。
-- `mid360_sdk_monitor` 会初始化 Livox-SDK2 并打印回调速率；如果使用相应参数，还可以请求 normal mode、点云发送或 IMU 发送。
+- `mid360_sdk_monitor` 会初始化 Livox-SDK2，默认通过 SDK discovery 发现雷达并打印回调速率；如果使用相应参数，还可以请求 normal mode、点云发送或 IMU 发送。
 - `mid360_sdk_dump` 会初始化 Livox-SDK2 并把回调数据解析成 CSV；CSV 只建议短时采样，默认不主动发送控制请求，只有带相应参数时才会请求 normal mode、点云发送或 IMU 发送。
 - `scripts/run_ros2_mid360_rviz.sh` 会启动官方 ROS2 驱动和 RViz，并通过 `livox_ros_driver2` 连接雷达；它需要传入已经构建好的 ROS2 工作区，`external/livox_ros_driver2` 只是源码 submodule。
 

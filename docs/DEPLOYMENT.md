@@ -115,7 +115,7 @@ Python 版：
 livox-mid360-diagnostics autoconfig
 ```
 
-命令会发现雷达，搜索用户目录和当前目录下的 MID360 配置文件，然后显示方向键菜单。上下方向键移动，空格选择/取消，回车确认，`q` 或 `Esc` 退出不修改。
+命令会发现雷达，搜索用户目录和当前目录下的 MID360 配置文件，然后显示带颜色的方向键菜单。配置会按“推荐更新 / 已匹配 / 其它候选”分组，示例、依赖和构建产物里的低优先级配置默认折叠。上下方向键移动，空格选择/取消，`a` 显示或隐藏低优先级候选，回车确认，`q` 或 `Esc` 退出不修改。需要默认展示所有候选时可加 `--show-all`；需要纯文本输出时可加 `--no-color` 或设置 `NO_COLOR=1`。
 
 C++ 版：
 
@@ -160,7 +160,13 @@ SDK 回调统计：
 ./build/sdk2/livox_mid360_diagnostics monitor
 ```
 
-默认显示表格仪表盘，并在原位置刷新，不会持续刷出新行。`Link` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`Health` 表示雷达上报的诊断码。
+默认先通过 Livox-SDK2 discovery 发现雷达，然后显示表格仪表盘，并在原位置刷新，不会持续刷出新行。`monitor` 不再默认使用 `LIVOX_MID360_CONFIG` 里的雷达 IP。多网卡场景可以显式指定：
+
+```bash
+./build/sdk2/livox_mid360_diagnostics monitor --iface eth0
+```
+
+通过非交互 SSH 或日志管道运行时，会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
 
 不通过 ROS 解析并导出短时点云/IMU CSV：
 

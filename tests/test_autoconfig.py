@@ -8,6 +8,7 @@ from io import StringIO
 from pathlib import Path
 
 from livox_mid360_diagnostics.autoconfig import (
+    ConfigState,
     is_mid360_config_file,
     parse_selection,
     print_config_table,
@@ -80,13 +81,45 @@ class ConfigIpUpdateTest(unittest.TestCase):
 
     def test_config_table_omits_empty_input_when_filtered_by_caller(self) -> None:
         output = StringIO()
-        states = [(Path("/tmp/MID360_config.json"), "192.168.1.12", "mismatch")]
+        states = [ConfigState(Path("/tmp/MID360_config.json"), "192.168.1.12", "mismatch")]
         with redirect_stdout(output):
             print_config_table(states)
 
         text = output.getvalue()
         self.assertIn("current=192.168.1.12", text)
         self.assertNotIn("current=N/A", text)
+
+    def test_config_table_folds_low_priority_paths(self) -> None:
+        states = [
+            ConfigState(Path("config/MID360_config.local.json"), "192.168.1.12", "mismatch", False, 0),
+            ConfigState(Path("external/Livox-SDK2/samples/demo/mid360_config.json"), "192.168.1.13", "mismatch", True, 1),
+        ]
+
+        folded = StringIO()
+        with redirect_stdout(folded):
+            print_config_table(states)
+        folded_text = folded.getvalue()
+        self.assertIn("config/MID360_config.local.json", folded_text)
+        self.assertIn("其它低优先级候选已折叠: 1", folded_text)
+        self.assertNotIn("external/Livox-SDK2", folded_text)
+
+        expanded = StringIO()
+        with redirect_stdout(expanded):
+            print_config_table(states, show_all=True)
+        expanded_text = expanded.getvalue()
+        self.assertIn("external/Livox-SDK2", expanded_text)
+
+    def test_config_table_shows_low_priority_when_only_choices(self) -> None:
+        states = [
+            ConfigState(Path("external/Livox-SDK2/samples/demo/mid360_config.json"), "192.168.1.13", "mismatch", True, 0),
+        ]
+
+        output = StringIO()
+        with redirect_stdout(output):
+            print_config_table(states)
+        text = output.getvalue()
+        self.assertIn("external/Livox-SDK2", text)
+        self.assertNotIn("低优先级候选已折叠", text)
 
     def test_mid360_config_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
