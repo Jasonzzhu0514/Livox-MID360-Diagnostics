@@ -10,11 +10,11 @@ C++ CLI 是推荐主路径。它直接走 Livox-SDK2 discovery，不要求提前
 
 ### 准备
 
-普通使用优先下载 GitHub Release 里的预编译包：
+普通使用优先下载 GitHub Release 里的预编译二进制：
 
 - 最新版本：<https://github.com/Jasonzzhu0514/Livox-MID360-Diagnostics/releases/latest>
 
-目标设备上可以自动下载当前架构的单文件启动器并运行：
+目标设备上可以自动下载当前架构的单体程序并运行：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
@@ -29,7 +29,7 @@ chmod +x ./livox_mid360_diagnostics
 ./livox_mid360_diagnostics
 ```
 
-这个单文件启动器会在首次运行时解出完整工具包，然后启动诊断入口。后续继续执行 `./livox_mid360_diagnostics` 即可。
+这个文件就是完整 C++ 诊断入口。后续继续执行 `./livox_mid360_diagnostics` 即可。
 
 如果已经 clone 了本仓库，也可以运行：
 
@@ -78,7 +78,7 @@ bash scripts/use_cpp_release.sh
 
 ### 可选功能
 
-`dump` 可从菜单进入，也可以用命令行直接指定 CSV 输出。CSV 不适合长期记录；常规验证请用 `monitor`。
+`dump` 可从菜单进入，也可以用命令行直接指定 CSV 输出。它需要 `MID360_config.json`；CSV 不适合长期记录，常规验证请用 `monitor`。
 
 ```bash
 ./livox_mid360_diagnostics dump --duration 10 --points "$PWD/mid360_points.csv" --imu "$PWD/mid360_imu.csv"

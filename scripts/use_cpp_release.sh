@@ -10,7 +10,6 @@ _livox_mid360_release_fail() {
 }
 
 _livox_mid360_repo="${LIVOX_MID360_RELEASE_REPO:-Jasonzzhu0514/Livox-MID360-Diagnostics}"
-_livox_mid360_base_dir="${LIVOX_MID360_RELEASE_DIR:-$HOME/.local/share/livox-mid360-diagnostics}"
 _livox_mid360_launcher_path="${LIVOX_MID360_LAUNCHER_PATH:-$PWD/livox_mid360_diagnostics}"
 _livox_mid360_arch="$(uname -m)"
 
@@ -38,10 +37,6 @@ command -v tar >/dev/null 2>&1 || {
   _livox_mid360_release_fail "tar is required"
 }
 
-mkdir -p "$_livox_mid360_base_dir" || {
-  _livox_mid360_release_fail "failed to create $_livox_mid360_base_dir"
-}
-
 _livox_mid360_url="$(
   curl -fsSL "https://api.github.com/repos/$_livox_mid360_repo/releases/latest" |
     awk -F\" -v suffix="$_livox_mid360_suffix" '$2 == "browser_download_url" && $4 ~ suffix "$" { print $4; exit }'
@@ -59,34 +54,47 @@ if [[ -z "$_livox_mid360_url" ]]; then
   if [[ -z "$_livox_mid360_tar_url" ]]; then
     _livox_mid360_release_fail "release asset not found for $_livox_mid360_suffix"
   fi
-  _livox_mid360_pkg="${_livox_mid360_tar_url##*/}"
-  _livox_mid360_release_dir="$_livox_mid360_base_dir/${_livox_mid360_pkg%.tar.gz}"
-  _livox_mid360_pkg_path="$_livox_mid360_base_dir/$_livox_mid360_pkg"
-  if [[ ! -x "$_livox_mid360_release_dir/env.sh" ]]; then
-    echo "Downloading $_livox_mid360_pkg"
-    curl -fsSL "$_livox_mid360_tar_url" -o "$_livox_mid360_pkg_path" || {
-      _livox_mid360_release_fail "download failed: $_livox_mid360_tar_url"
-    }
-    tar -xzf "$_livox_mid360_pkg_path" -C "$_livox_mid360_base_dir" || {
-      _livox_mid360_release_fail "failed to extract $_livox_mid360_pkg_path"
-    }
+  _livox_mid360_tmp_dir="$(mktemp -d)"
+  _livox_mid360_pkg="$_livox_mid360_tmp_dir/${_livox_mid360_tar_url##*/}"
+  echo "Downloading ${_livox_mid360_tar_url##*/}"
+  curl -fsSL "$_livox_mid360_tar_url" -o "$_livox_mid360_pkg" || {
+    rm -rf "$_livox_mid360_tmp_dir"
+    _livox_mid360_release_fail "download failed: $_livox_mid360_tar_url"
+  }
+  tar -xzf "$_livox_mid360_pkg" -C "$_livox_mid360_tmp_dir" || {
+    rm -rf "$_livox_mid360_tmp_dir"
+    _livox_mid360_release_fail "failed to extract $_livox_mid360_pkg"
+  }
+  _livox_mid360_extracted_binary="$(find "$_livox_mid360_tmp_dir" -type f -name 'livox_mid360_diagnostics-linux-*' -print -quit)"
+  if [[ -n "$_livox_mid360_extracted_binary" ]]; then
+    cp "$_livox_mid360_extracted_binary" "$_livox_mid360_launcher_path"
+    chmod +x "$_livox_mid360_launcher_path"
+    rm -rf "$_livox_mid360_tmp_dir"
+  else
+    _livox_mid360_release_dir="$(find "$_livox_mid360_tmp_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+    if [[ -z "$_livox_mid360_release_dir" || ! -x "$_livox_mid360_release_dir/env.sh" ]]; then
+      rm -rf "$_livox_mid360_tmp_dir"
+      _livox_mid360_release_fail "legacy release layout not recognized"
+    fi
+    _livox_mid360_install_dir="${LIVOX_MID360_RELEASE_DIR:-$HOME/.local/share/livox-mid360-diagnostics}/${_livox_mid360_release_dir##*/}"
+    mkdir -p "${_livox_mid360_install_dir%/*}"
+    rm -rf "$_livox_mid360_install_dir"
+    mv "$_livox_mid360_release_dir" "$_livox_mid360_install_dir"
+    rm -rf "$_livox_mid360_tmp_dir"
+    cat > "$_livox_mid360_launcher_path" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+release_root="$_livox_mid360_install_dir"
+export LIVOX_MID360_DIAGNOSTICS_ROOT="\$release_root"
+export LIVOX_MID360_CONFIG="\$release_root/config/MID360_config.local.json"
+export PATH="\$release_root/bin:\$PATH"
+exec "\$release_root/bin/livox_mid360_diagnostics" "\$@"
+EOF
+    chmod +x "$_livox_mid360_launcher_path"
   fi
-  if [[ -x "$_livox_mid360_release_dir/livox_mid360_diagnostics" ]]; then
-    ln -sf "$_livox_mid360_release_dir/livox_mid360_diagnostics" "$_livox_mid360_launcher_path"
-    echo "Ready: $_livox_mid360_launcher_path"
-    echo "Run:"
-    echo "  ./$(basename "$_livox_mid360_launcher_path")"
-    exit 0
-  fi
-  echo "Ready: $_livox_mid360_release_dir"
-  echo "This release uses the legacy layout. Run:"
-  echo "  cd \"$_livox_mid360_release_dir\""
-  echo "  source ./env.sh"
-  echo "  livox_mid360_diagnostics"
-  exit 0
 fi
 
-if [[ ! -x "$_livox_mid360_launcher_path" ]]; then
+if [[ ! -x "$_livox_mid360_launcher_path" && -n "$_livox_mid360_url" ]]; then
   echo "Downloading ${_livox_mid360_url##*/} -> $_livox_mid360_launcher_path"
   curl -fsSL "$_livox_mid360_url" -o "$_livox_mid360_launcher_path" || {
     _livox_mid360_release_fail "download failed: $_livox_mid360_url"

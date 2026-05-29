@@ -83,7 +83,7 @@ source scripts/prepare_config.sh
 ./scripts/setup_cpp.sh
 ```
 
-这一步会编译 `external/Livox-SDK2` 和本仓库的 `livox_mid360_diagnostics`、`mid360_sdk_monitor`、`mid360_sdk_dump`，但不会运行 SDK 工具。
+这一步会编译 `external/Livox-SDK2` 和本仓库的单体 C++ 入口 `livox_mid360_diagnostics`，但不会运行 SDK 工具。
 
 如果目标设备不想拉 submodule、也不想编译 SDK，可以在同架构 Linux 设备上生成 C++ 预编译包：
 
@@ -91,18 +91,19 @@ source scripts/prepare_config.sh
 ./scripts/package_cpp_prebuilt.sh
 ```
 
-生成预编译包的机器需要 submodule；目标设备只需要拿到 `dist/prebuilt/*.tar.gz`，解压后执行：
+生成预编译二进制的机器需要 submodule；目标设备只需要拿到对应架构的 `dist/prebuilt/livox_mid360_diagnostics-linux-*`：
 
 ```bash
-source ./env.sh
+mv ./livox_mid360_diagnostics-linux-* ./livox_mid360_diagnostics
+chmod +x ./livox_mid360_diagnostics
+./livox_mid360_diagnostics
 ```
 
-远端交互式使用时，先登录再加载环境：
+远端交互式使用时，先登录再运行：
 
 ```bash
 ssh user@host
-cd livox-mid360-diagnostics-prebuilt
-source ./env.sh
+./livox_mid360_diagnostics
 ```
 
 ## 7. 接入雷达后的配置流程

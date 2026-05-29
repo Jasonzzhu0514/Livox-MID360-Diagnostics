@@ -18,29 +18,19 @@
 #define LIVOX_MID360_DIAGNOSTICS_VERSION "unknown"
 #endif
 
-namespace {
+int run_mid360_config_tool(int argc, char** argv);
+#ifdef LIVOX_MID360_HAS_SDK_TOOLS
+int run_mid360_sdk_monitor(int argc, char** argv);
+int run_mid360_sdk_dump(int argc, char** argv);
+#endif
 
-std::string executable_dir() {
-  char buffer[PATH_MAX] = {};
-  const ssize_t size = readlink("/proc/self/exe", buffer, sizeof(buffer) - 1);
-  if (size > 0) {
-    buffer[size] = '\0';
-    std::string path(buffer);
-    const std::string::size_type slash = path.find_last_of('/');
-    if (slash != std::string::npos) {
-      return path.substr(0, slash);
-    }
-  }
-  return ".";
-}
+namespace {
 
 struct MenuItem {
   std::string command;
   std::string description;
   std::string badge;
 };
-
-bool g_menu_alt_handoff = false;
 
 void usage(const char* argv0) {
   std::cout
@@ -137,10 +127,6 @@ std::string render_menu(const std::array<MenuItem, 4>& items, size_t cursor) {
   return out.str();
 }
 
-bool command_uses_live_tui(const std::string& command) {
-  return command == "monitor" || command == "sdk-monitor";
-}
-
 std::string choose_command_menu() {
   const std::array<MenuItem, 4> items = {{
       {"autoconfig", "发现雷达并选择要更新的配置文件", "CONFIG"},
@@ -216,30 +202,23 @@ std::string choose_command_menu() {
     }
   }
   const std::string selected = items[cursor].command;
-  g_menu_alt_handoff = command_uses_live_tui(selected);
   tcsetattr(STDIN_FILENO, TCSANOW, &original);
-  if (!g_menu_alt_handoff) {
-    std::cout << neon::leave_alt_screen() << std::flush;
-  }
+  std::cout << neon::leave_alt_screen() << std::flush;
   return selected;
-}
-
-std::string target_for_command(const std::string& command) {
-  if (command == "autoconfig" || command == "config") {
-    return "mid360_config_tool";
-  }
-  if (command == "monitor" || command == "sdk-monitor") {
-    return "mid360_sdk_monitor";
-  }
-  if (command == "dump" || command == "sdk-dump") {
-    return "mid360_sdk_dump";
-  }
-  return "";
 }
 
 bool has_config_arg(const std::vector<std::string>& args) {
   for (const std::string& arg : args) {
     if (arg == "--config" || arg.rfind("--config=", 0) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool has_help_arg(const std::vector<std::string>& args) {
+  for (const std::string& arg : args) {
+    if (arg == "-h" || arg == "--help") {
       return true;
     }
   }
@@ -253,6 +232,46 @@ bool file_exists(const std::string& path) {
 
 bool command_needs_config(const std::string& command) {
   return command == "dump" || command == "sdk-dump";
+}
+
+bool known_command(const std::string& command) {
+  return command == "autoconfig" || command == "config" ||
+      command == "monitor" || command == "sdk-monitor" ||
+      command == "dump" || command == "sdk-dump";
+}
+
+std::string child_argv0(const std::string& command) {
+  if (command == "autoconfig" || command == "config") {
+    return "mid360_config_tool";
+  }
+  if (command == "monitor" || command == "sdk-monitor") {
+    return "mid360_sdk_monitor";
+  }
+  if (command == "dump" || command == "sdk-dump") {
+    return "mid360_sdk_dump";
+  }
+  return command;
+}
+
+int run_command(const std::string& command, int argc, std::vector<char*>& raw_args) {
+  if (command == "autoconfig" || command == "config") {
+    return run_mid360_config_tool(argc, raw_args.data());
+  }
+#ifdef LIVOX_MID360_HAS_SDK_TOOLS
+  if (command == "monitor" || command == "sdk-monitor") {
+    return run_mid360_sdk_monitor(argc, raw_args.data());
+  }
+  if (command == "dump" || command == "sdk-dump") {
+    return run_mid360_sdk_dump(argc, raw_args.data());
+  }
+#else
+  if (command == "monitor" || command == "sdk-monitor" || command == "dump" || command == "sdk-dump") {
+    std::cerr << "ERROR: SDK command is unavailable; rebuild with Livox-SDK2.\n";
+    return 2;
+  }
+#endif
+  std::cerr << "ERROR: unknown command: " << command << "\n";
+  return 2;
 }
 
 }  // namespace
@@ -271,32 +290,14 @@ int main(int argc, char** argv) {
   if (command == "quit") {
     return 0;
   }
-  const std::string target_name = target_for_command(command);
-  if (target_name.empty()) {
-    if (g_menu_alt_handoff) {
-      std::cout << neon::leave_alt_screen() << std::flush;
-      g_menu_alt_handoff = false;
-    }
+  if (!known_command(command)) {
     std::cerr << "ERROR: unknown command: " << command << "\n";
     usage(argv[0]);
     return 2;
   }
 
-  const std::string target_path = executable_dir() + "/" + target_name;
-  if (access(target_path.c_str(), X_OK) != 0) {
-    if (g_menu_alt_handoff) {
-      std::cout << neon::leave_alt_screen() << std::flush;
-      g_menu_alt_handoff = false;
-    }
-    std::cerr << "ERROR: required executable not found: " << target_path << "\n";
-    if (target_name == "mid360_sdk_monitor" || target_name == "mid360_sdk_dump") {
-      std::cerr << "Run ./scripts/build_cpp_with_sdk2.sh to build SDK commands.\n";
-    }
-    return 2;
-  }
-
   std::vector<std::string> child_args;
-  child_args.push_back(target_path);
+  child_args.push_back(child_argv0(command));
   for (int i = 2; i < argc; ++i) {
     child_args.push_back(argv[i]);
   }
@@ -309,12 +310,17 @@ int main(int argc, char** argv) {
     child_args.push_back("mid360_imu.csv");
   }
   const char* config_path = std::getenv("LIVOX_MID360_CONFIG");
-  if (command_needs_config(command) && !has_config_arg(child_args) && config_path && std::strlen(config_path) > 0) {
+  const bool needs_config = command_needs_config(command) && !has_help_arg(child_args);
+  if (needs_config && !has_config_arg(child_args) && config_path && std::strlen(config_path) > 0) {
     child_args.push_back("--config");
     child_args.push_back(config_path);
-  } else if (command_needs_config(command) && !has_config_arg(child_args) && file_exists("config/MID360_config.local.json")) {
+  } else if (needs_config && !has_config_arg(child_args) && file_exists("config/MID360_config.local.json")) {
     child_args.push_back("--config");
     child_args.push_back("config/MID360_config.local.json");
+  } else if (needs_config && !has_config_arg(child_args)) {
+    std::cerr << "ERROR: dump needs a MID360_config.json path.\n"
+              << "Use monitor for normal validation, or pass --config PATH / set LIVOX_MID360_CONFIG before dumping CSV.\n";
+    return 2;
   }
 
   std::vector<char*> raw_args;
@@ -323,14 +329,5 @@ int main(int argc, char** argv) {
     raw_args.push_back(arg.data());
   }
   raw_args.push_back(nullptr);
-
-  if (g_menu_alt_handoff) {
-    setenv("LIVOX_MID360_ALT_SCREEN", "1", 1);
-  }
-  execv(target_path.c_str(), raw_args.data());
-  if (g_menu_alt_handoff) {
-    std::cout << neon::leave_alt_screen() << std::flush;
-  }
-  std::cerr << "ERROR: failed to execute " << target_path << "\n";
-  return 2;
+  return run_command(command, static_cast<int>(child_args.size()), raw_args);
 }

@@ -51,8 +51,6 @@ jobs:
           REQUIRED=(
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
-            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
-            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
           )
 
           for asset in "${REQUIRED[@]}"; do
@@ -106,9 +104,14 @@ jobs:
           ASSETS=(
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
-            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
-            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
           )
+          for optional_asset in \
+            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64" \
+            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"; do
+            if [[ -s "${optional_asset}" ]]; then
+              ASSETS+=("${optional_asset}")
+            fi
+          done
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release already exists for ${TAG}" >&2
