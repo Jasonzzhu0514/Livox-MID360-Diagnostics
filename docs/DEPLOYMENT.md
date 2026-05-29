@@ -115,7 +115,7 @@ Python 版：
 livox-mid360-diagnostics autoconfig
 ```
 
-命令会发现雷达，搜索用户目录和当前目录下的 MID360 配置文件，然后显示带颜色的方向键菜单。配置会按“推荐更新 / 已匹配 / 其它候选”分组，示例、依赖和构建产物里的低优先级配置默认折叠。上下方向键移动，空格选择/取消，`a` 显示或隐藏低优先级候选，回车确认，`q` 或 `Esc` 退出不修改。需要默认展示所有候选时可加 `--show-all`；需要纯文本输出时可加 `--no-color` 或设置 `NO_COLOR=1`。
+命令会发现雷达，搜索用户目录和当前目录下的 MID360 配置文件，然后显示 Neon Protocol 自适应表格。配置会按“推荐更新 / 已匹配 / 其它候选”分组，示例、依赖和构建产物里的低优先级配置默认折叠。上下方向键移动，空格选择/取消，`a` 显示或隐藏低优先级候选，回车确认，`q` 或 `Esc` 退出不修改；如果只有低优先级候选，会直接显示。需要默认展示所有候选时可加 `--show-all`；需要纯文本输出时可加 `--no-color` 或设置 `NO_COLOR=1`。
 
 C++ 版：
 
@@ -124,7 +124,7 @@ C++ 版：
 ./build/sdk2/livox_mid360_diagnostics autoconfig
 ```
 
-直接运行 `livox_mid360_diagnostics` 会显示 `autoconfig`、`monitor`、`dump`、`quit` 四个交互选项。
+直接运行 `livox_mid360_diagnostics` 会显示 Neon Protocol 自适应入口，选择 `autoconfig`、`monitor`、`dump` 或 `quit`。C++ `autoconfig`、`monitor`、`dump` 在交互终端都会使用 Neon Protocol TUI 并随窗口大小调整；非交互 SSH 或日志管道会降级为纯文本摘要。
 
 如果没有安装 Python package，可以用：
 
@@ -144,7 +144,7 @@ Python 版只能被动监听本机 UDP 端口；完整的 SDK 回调统计和 CS
 
 ### Python 版被动查看
 
-轻量级终端查看 UDP 包速率：
+轻量级终端查看 UDP 包速率，交互终端会显示 Neon Protocol 面板并原地刷新：
 
 ```bash
 livox-mid360-diagnostics udp-monitor
@@ -160,13 +160,13 @@ SDK 回调统计：
 ./build/sdk2/livox_mid360_diagnostics monitor
 ```
 
-默认先通过 Livox-SDK2 discovery 发现雷达，然后显示表格仪表盘，并在原位置刷新，不会持续刷出新行。`monitor` 不再默认使用 `LIVOX_MID360_CONFIG` 里的雷达 IP。多网卡场景可以显式指定：
+默认先通过 Livox-SDK2 discovery 发现雷达，然后显示 Neon Protocol 实时 TUI，并在原位置刷新，不会持续刷出新行。`monitor` 不再默认使用 `LIVOX_MID360_CONFIG` 里的雷达 IP。多网卡场景可以显式指定：
 
 ```bash
 ./build/sdk2/livox_mid360_diagnostics monitor --iface eth0
 ```
 
-通过非交互 SSH 或日志管道运行时，会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
+交互终端中 `monitor` 会显示设备侧栏、点云/IMU 速率条、点云密度预览和模块诊断，画面约 20 FPS 原地刷新；`--interval` 控制速率统计窗口。通过非交互 SSH 或日志管道运行时，会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
 
 不通过 ROS 解析并导出短时点云/IMU CSV：
 
@@ -174,7 +174,7 @@ SDK 回调统计：
 ./build/sdk2/livox_mid360_diagnostics dump --duration 10 --points "$PWD/mid360_points.csv" --imu "$PWD/mid360_imu.csv"
 ```
 
-`livox_mid360_diagnostics dump` 通过 Livox-SDK2 回调接收数据，不启动 ROS launch。点云会统一转换成米制 `x_m,y_m,z_m`，IMU 输出到单独 CSV。CSV 只建议短时采样；长期观察请用 `monitor`。
+`livox_mid360_diagnostics dump` 通过 Livox-SDK2 回调接收数据，不启动 ROS launch。交互终端中会显示 Neon Protocol 采样进度面板并原地刷新；非交互运行时保留每个 interval 一行摘要。点云会统一转换成米制 `x_m,y_m,z_m`，IMU 输出到单独 CSV。CSV 只建议短时采样；长期观察请用 `monitor`。
 
 如果需要请求雷达进入 normal mode 并开启点云/IMU，只在确认雷达连接正确且物理状态健康后使用：
 

@@ -1,3 +1,5 @@
+#include "neon_tui.hpp"
+
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
@@ -18,6 +20,7 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -83,6 +86,13 @@ struct ConfigView {
   size_t hidden_count = 0;
 };
 
+struct DetectionSummary {
+  std::string iface;
+  Discovery result;
+};
+
+std::vector<std::string> detection_rows(const DetectionSummary& summary);
+
 struct Theme {
   bool enabled = false;
   std::string reset;
@@ -99,6 +109,9 @@ const std::array<const char*, 2> kMid360ConfigKeys = {"MID360", "Mid360s"};
 bool g_screen_active = false;
 std::vector<std::string> g_scan_lines;
 Theme g_theme;
+volatile std::sig_atomic_t g_interrupted = 0;
+termios g_original_termios {};
+bool g_has_original_termios = false;
 
 std::string home_dir() {
   const char* home = std::getenv("HOME");
@@ -349,23 +362,52 @@ void debug(const Options& options, const std::string& message) {
   }
 }
 
+void handle_interrupt(int) {
+  g_interrupted = 1;
+}
+
+void throw_if_interrupted() {
+  if (g_interrupted) {
+    throw std::runtime_error("interrupted");
+  }
+}
+
 void progress(const std::string& message) {
-  const std::string line = cyan("扫描") + " " + message;
+  throw_if_interrupted();
+  const std::string line = (g_screen_active ? neon::text("扫描", neon::Color::Accent, true) : cyan("扫描")) + " " + message;
   if (g_screen_active) {
     g_scan_lines.push_back(line);
-    if (g_scan_lines.size() > 8) {
+    if (g_scan_lines.size() > 128) {
       g_scan_lines.erase(g_scan_lines.begin());
     }
-    std::cout << "\033[H\033[2J";
-    std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
-    std::cout << dim("=======================") << "\n\n";
-    for (const auto& item : g_scan_lines) {
-      std::cout << item << "\n";
+    const neon::Size term = neon::terminal_size();
+    std::ostringstream out;
+    out << neon::clear_screen()
+        << neon::header("LIVOX MID-360 AUTOCONFIG", "SCAN", std::max(40, term.cols));
+    const int panel_w = std::max(40, term.cols);
+    const int max_lines = std::max(3, term.rows - 8);
+    std::vector<std::string> rows;
+    const size_t begin = g_scan_lines.size() > static_cast<size_t>(max_lines)
+        ? g_scan_lines.size() - static_cast<size_t>(max_lines)
+        : 0;
+    for (size_t i = begin; i < g_scan_lines.size(); ++i) {
+      rows.push_back(g_scan_lines[i]);
     }
+    if (rows.empty()) {
+      rows.push_back("waiting for discovery output");
+    }
+    int used_rows = 3;
+    neon::append_lines(out, neon::box("DISCOVERY TRACE", rows, panel_w), panel_w, term.rows - used_rows - 1, used_rows);
+    neon::append_footer_at_bottom(out, "[CTRL+C] STOP", term.rows, panel_w, used_rows);
+    std::cout << out.str();
     std::cout.flush();
   } else {
     std::cout << line << std::endl;
   }
+}
+
+void render_scan_screen(const std::string& message) {
+  progress(message);
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -631,8 +673,12 @@ std::vector<std::string> discover_config_paths(const Options& options) {
   std::set<std::string> seen;
   std::vector<std::string> found;
   for (const std::string& root : config_search_roots()) {
+    throw_if_interrupted();
     if (!directory_exists(root)) {
       continue;
+    }
+    if (g_screen_active) {
+      progress("searching config files under " + root);
     }
     const std::string output = run_text(
         {
@@ -1097,6 +1143,159 @@ std::vector<size_t> map_visible_selection_to_original(
   return out;
 }
 
+std::string status_plain(const std::string& status) {
+  if (status == "mismatch") {
+    return "UPDATE";
+  }
+  if (status == "match") {
+    return "MATCH";
+  }
+  if (status == "unavailable") {
+    return "NO-IP";
+  }
+  return status.empty() ? "N/A" : status;
+}
+
+neon::Color status_color_for(const std::string& status) {
+  if (status == "mismatch") {
+    return neon::Color::Warning;
+  }
+  if (status == "match") {
+    return neon::Color::Success;
+  }
+  if (status == "unavailable") {
+    return neon::Color::Muted;
+  }
+  return neon::Color::Text;
+}
+
+std::vector<std::string> visible_group_labels(const ConfigView& view) {
+  std::vector<std::string> labels;
+  labels.insert(labels.end(), view.recommended.size(), "推荐更新");
+  labels.insert(labels.end(), view.matched.size(), "已匹配");
+  labels.insert(labels.end(), view.other.size(), "其它候选");
+  return labels;
+}
+
+std::vector<std::string> render_candidate_rows(
+    const std::vector<ConfigState>& visible_states,
+    const std::vector<std::string>& labels,
+    const std::vector<bool>& checked,
+    size_t cursor,
+    size_t first,
+    size_t max_rows,
+    int width) {
+  std::vector<std::string> rows;
+  rows.reserve(max_rows + 4);
+  rows.push_back("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。");
+  rows.push_back("");
+  const int path_width = std::max(10, width - 39);
+  for (size_t i = first; i < visible_states.size() && rows.size() < max_rows + 2; ++i) {
+    const auto& state = visible_states[i];
+    const bool active = i == cursor;
+    const bool is_checked = state.original_index < checked.size() && checked[state.original_index];
+    const std::string marker = active ? neon::text("▶", neon::Color::Accent, true) : " ";
+    const std::string check = is_checked ? neon::text("[x]", neon::Color::Success, true) : "[ ]";
+    const std::string index = neon::pad_left(std::to_string(i + 1), 2);
+    const std::string group = neon::text(neon::pad_right(i < labels.size() ? labels[i] : "候选", 8), neon::Color::Muted, true);
+    const std::string status = neon::text(neon::pad_right(status_plain(state.status), 7), status_color_for(state.status), true);
+    rows.push_back(marker + " " + check + " " + index + " " + group + " " + status + " " +
+                   neon::fit(compact_path(state.path, static_cast<size_t>(path_width)), path_width));
+  }
+  if (visible_states.empty()) {
+    rows.push_back(neon::text("当前可见列表为空。", neon::Color::Warning, true));
+  }
+  return rows;
+}
+
+std::string render_config_picker(
+    const std::vector<ConfigState>& states,
+    const DetectionSummary& summary,
+    bool show_all,
+    size_t cursor,
+    const std::vector<bool>& checked) {
+  const ConfigView view = make_config_view(states, show_all);
+  const std::vector<ConfigState> visible_states = flatten_config_view(view);
+  const std::vector<std::string> labels = visible_group_labels(view);
+  const neon::Size term = neon::terminal_size();
+  const int width = std::max(48, term.cols);
+  std::ostringstream out;
+  out << neon::clear_screen()
+      << neon::header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width);
+  int used_rows = 3;
+  if (term.rows < 16 || term.cols < 58) {
+    neon::append_line(out, neon::text("Terminal too small for Autoconfig TUI", neon::Color::Warning, true), width, used_rows);
+    neon::append_line(out, "Resize to at least 58x16.", width, used_rows);
+    neon::append_footer_at_bottom(out, "[ENTER] APPLY   [Q/ESC] QUIT", term.rows, width, used_rows);
+    return out.str();
+  }
+
+  const size_t selected_count = static_cast<size_t>(std::count(checked.begin(), checked.end(), true));
+  const std::string selection_line = "VISIBLE " + std::to_string(visible_states.size()) +
+      " / TOTAL " + std::to_string(states.size()) +
+      " / SELECTED " + std::to_string(selected_count);
+  const std::string hidden_line = view.hidden_count == 0
+      ? "LOW PRIORITY shown"
+      : "LOW PRIORITY folded: " + std::to_string(view.hidden_count) + " (press a)";
+
+  if (term.cols >= 104) {
+    const int gap = 1;
+    const int left_w = neon::clamp_int(term.cols / 3, 33, 44);
+    const int right_w = std::max(58, term.cols - left_w - gap);
+    const int max_candidate_rows = std::max(1, term.rows - used_rows - 6);
+    size_t first = 0;
+    if (!visible_states.empty() && cursor >= static_cast<size_t>(max_candidate_rows)) {
+      first = cursor - static_cast<size_t>(max_candidate_rows) + 1;
+    }
+    std::vector<std::string> left_rows = detection_rows(summary);
+    left_rows.push_back("");
+    left_rows.push_back(selection_line);
+    left_rows.push_back(hidden_line);
+    auto left = neon::box("DEVICE IDENTITY", left_rows, left_w);
+    auto right = neon::box(
+        "CONFIG CANDIDATES",
+        render_candidate_rows(visible_states, labels, checked, cursor, first, static_cast<size_t>(max_candidate_rows), right_w),
+        right_w);
+    neon::append_lines(out, neon::hstack(left, right, left_w, right_w, gap), width, term.rows - used_rows - 2, used_rows);
+  } else {
+    const int panel_w = width;
+    const int detection_budget = std::min(7, std::max(3, term.rows / 4));
+    std::vector<std::string> top_rows = detection_rows(summary);
+    if (static_cast<int>(top_rows.size()) > detection_budget) {
+      top_rows.resize(static_cast<size_t>(detection_budget));
+    }
+    top_rows.push_back(selection_line);
+    top_rows.push_back(hidden_line);
+    const auto identity = neon::box("DEVICE IDENTITY", top_rows, panel_w);
+    if (term.rows - used_rows - 2 >= static_cast<int>(identity.size()) + 5) {
+      neon::append_lines(out, identity, width, term.rows - used_rows - 2, used_rows);
+    }
+    const int max_candidate_rows = std::max(1, term.rows - used_rows - 6);
+    size_t first = 0;
+    if (!visible_states.empty() && cursor >= static_cast<size_t>(max_candidate_rows)) {
+      first = cursor - static_cast<size_t>(max_candidate_rows) + 1;
+    }
+    neon::append_lines(
+        out,
+        neon::box(
+            "CONFIG CANDIDATES",
+            render_candidate_rows(visible_states, labels, checked, cursor, first, static_cast<size_t>(max_candidate_rows), panel_w),
+            panel_w),
+        width,
+        term.rows - used_rows - 2,
+        used_rows);
+  }
+  if (!visible_states.empty() && used_rows < term.rows - 1) {
+    neon::append_line(
+        out,
+        neon::text("PATH ", neon::Color::Muted, true) + neon::fit(visible_states[cursor].path, std::max(8, width - 5)),
+        width,
+        used_rows);
+  }
+  neon::append_footer_at_bottom(out, "[↑/↓] MOVE   [SPACE] SELECT   [A] LOW-PRIORITY   [ENTER] APPLY   [Q/ESC] QUIT", term.rows, width, used_rows);
+  return out.str();
+}
+
 void print_config_entry(size_t index, const ConfigState& state, bool cursor, bool checked) {
   std::cout << (cursor ? cyan("> ") : "  ")
             << "[" << (checked ? green("x") : " ") << "] "
@@ -1153,10 +1352,24 @@ void print_config_table(const std::vector<ConfigState>& states, bool show_all = 
   print_hidden_hint(view.hidden_count);
 }
 
-struct DetectionSummary {
-  std::string iface;
-  Discovery result;
-};
+std::string detection_value(const std::string& value) {
+  return value.empty() ? "N/A" : value;
+}
+
+std::vector<std::string> detection_rows(const DetectionSummary& summary) {
+  const auto& result = summary.result;
+  return {
+      "IFACE        " + neon::text(detection_value(summary.iface), neon::Color::Accent, true),
+      "IFACE_IP     " + detection_value(result.iface_ip),
+      "LIDAR_IP     " + neon::text(detection_value(result.lidar_ip), result.lidar_ip.empty() ? neon::Color::Danger : neon::Color::Success, true),
+      "ARP_HOST     " + detection_value(result.requested_host_ip),
+      "PACKETS      " + std::to_string(result.raw_packets),
+      "METHOD       " + detection_value(result.method),
+      "",
+      neon::badge("HEALTH", result.lidar_ip.empty() ? "WAIT" : "FOUND", result.lidar_ip.empty() ? neon::Color::Warning : neon::Color::Success),
+      neon::badge("MODE", "AUTOCONFIG", neon::Color::Accent),
+  };
+}
 
 void print_detection_summary(const DetectionSummary& summary) {
   const auto& result = summary.result;
@@ -1174,7 +1387,16 @@ void enter_screen() {
   if (!isatty(STDOUT_FILENO)) {
     return;
   }
-  std::cout << "\033[?1049h\033[?25l\033[H\033[2J" << std::flush;
+  if (isatty(STDIN_FILENO) && !g_has_original_termios && tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
+    termios raw = g_original_termios;
+    raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+      g_has_original_termios = true;
+    }
+  }
+  std::cout << neon::enter_alt_screen() << std::flush;
   g_screen_active = true;
 }
 
@@ -1183,7 +1405,11 @@ void leave_screen() {
     return;
   }
   g_screen_active = false;
-  std::cout << "\033[?25h\033[?1049l" << std::flush;
+  if (g_has_original_termios) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios);
+    g_has_original_termios = false;
+  }
+  std::cout << neon::leave_alt_screen() << std::flush;
 }
 
 std::vector<size_t> choose_configs_interactively(
@@ -1192,11 +1418,18 @@ std::vector<size_t> choose_configs_interactively(
     bool initial_show_all) {
   if (states.empty()) {
     if (g_screen_active) {
-      std::cout << "\033[H\033[2J";
-      std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
-      std::cout << dim("=======================") << "\n\n";
-      print_detection_summary(summary);
-      std::cout << "\n可更新的 MID360 配置文件：\n  未发现带有雷达 IP 的配置文件。\n";
+      const neon::Size term = neon::terminal_size();
+      std::ostringstream out;
+      out << neon::clear_screen()
+          << neon::header("LIVOX MID-360 AUTOCONFIG", "CONFIG", std::max(40, term.cols));
+      std::vector<std::string> rows = detection_rows(summary);
+      rows.push_back("");
+      rows.push_back(neon::text("未发现带有雷达 IP 的配置文件。", neon::Color::Warning, true));
+      for (const auto& row : neon::box("DEVICE IDENTITY", rows, std::max(40, term.cols))) {
+        out << row << "\n";
+      }
+      out << neon::footer("[Q/ESC] QUIT", std::max(40, term.cols)) << "\n";
+      std::cout << out.str() << std::flush;
     } else {
       print_detection_summary(summary);
       print_config_table(states, initial_show_all);
@@ -1241,26 +1474,7 @@ std::vector<size_t> choose_configs_interactively(
     } else if (cursor >= visible_states.size()) {
       cursor = visible_states.size() - 1;
     }
-    std::cout << "\033[H\033[2J";
-    std::cout << bold(blue("Livox MID360 Autoconfig")) << "\n";
-    std::cout << dim("=======================") << "\n\n";
-    print_detection_summary(summary);
-    std::cout << "\n" << bold("选择要更新的 MID360 配置文件") << "\n";
-    std::cout << dim("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。") << "\n";
-
-    const ConfigView view = make_config_view(states, show_all);
-    size_t offset = 0;
-    print_config_section("推荐更新", view.recommended, offset, cursor, &checked);
-    print_config_section("已匹配", view.matched, offset, cursor, &checked);
-    print_config_section("其它候选", view.other, offset, cursor, &checked);
-    if (offset == 0) {
-      std::cout << "\n  当前可见列表为空。\n";
-    }
-    print_hidden_hint(view.hidden_count);
-    if (!visible_states.empty()) {
-      const auto& state = visible_states[cursor];
-      std::cout << "\n" << dim("完整路径: " + state.path) << "\n";
-    }
+    std::cout << render_config_picker(states, summary, show_all, cursor, checked);
     std::cout.flush();
   };
   auto read_char_timeout = [](char& out, int timeout_ms) {
@@ -1317,8 +1531,10 @@ std::vector<size_t> choose_configs_interactively(
       redraw();
     }
   }
-  tcsetattr(STDIN_FILENO, TCSANOW, &original);
-  std::cout << "\033[H\033[2J";
+  if (!g_has_original_termios) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &original);
+  }
+  std::cout << neon::clear_screen();
   if (cancelled) {
     return {};
   }
@@ -1396,17 +1612,22 @@ Options parse_args(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   try {
+    std::signal(SIGINT, handle_interrupt);
     const Options options = parse_args(argc, argv);
     init_theme(options.no_color);
+    neon::set_color_enabled(!options.no_color);
     const bool interactive_picker = !options.apply && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     if (interactive_picker) {
       enter_screen();
+      render_scan_screen("preparing config search");
     }
     const auto config_paths = resolve_config_paths(options);
+    throw_if_interrupted();
     const auto ifaces = candidate_ifaces(options, config_paths);
 
     progress("starting MID360 discovery");
     const auto [iface, result] = discover(ifaces, options);
+    throw_if_interrupted();
     const DetectionSummary summary{iface, result};
     if (!interactive_picker) {
       print_detection_summary(summary);
@@ -1531,6 +1752,10 @@ int main(int argc, char** argv) {
     return 0;
   } catch (const std::exception& exc) {
     leave_screen();
+    if (std::string(exc.what()) == "interrupted") {
+      std::cerr << "Interrupted.\n";
+      return 130;
+    }
     std::cerr << "ERROR: " << exc.what() << "\n";
     return 2;
   }

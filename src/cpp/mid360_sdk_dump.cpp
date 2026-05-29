@@ -1,3 +1,5 @@
+#include "neon_tui.hpp"
+
 #include "livox_lidar_api.h"
 #include "livox_lidar_def.h"
 
@@ -18,6 +20,9 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/select.h>
+#include <termios.h>
+#include <unistd.h>
 
 namespace {
 
@@ -55,6 +60,9 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 std::atomic<bool> g_running{true};
 std::atomic<bool> g_control_requested{false};
+std::atomic<bool> g_tui_active{false};
+termios g_original_termios {};
+bool g_has_original_termios = false;
 
 void stop(int) {
   g_running = false;
@@ -216,12 +224,14 @@ void imu_callback(const uint32_t handle, const uint8_t dev_type, LivoxLidarEther
 
 void async_control_callback(livox_status status, uint32_t handle, LivoxLidarAsyncControlResponse* response, void*) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  std::cout << "control_response: handle=" << handle << " status=" << status;
-  if (response) {
-    std::cout << " ret_code=" << static_cast<unsigned>(response->ret_code)
-              << " error_key=" << response->error_key;
+  if (!g_tui_active.load()) {
+    std::cout << "control_response: handle=" << handle << " status=" << status;
+    if (response) {
+      std::cout << " ret_code=" << static_cast<unsigned>(response->ret_code)
+                << " error_key=" << response->error_key;
+    }
+    std::cout << std::endl;
   }
-  std::cout << std::endl;
 }
 
 std::string json_string_value(const std::string& text, const std::string& key) {
@@ -231,6 +241,50 @@ std::string json_string_value(const std::string& text, const std::string& key) {
     return match[1].str();
   }
   return "";
+}
+
+std::string format_duration(double seconds) {
+  return neon::duration(seconds);
+}
+
+std::string format_rate(double value, const std::string& suffix) {
+  return neon::fixed(value, 1) + " " + suffix;
+}
+
+std::string format_compact_rate(double value, const std::string& unit) {
+  return neon::compact_rate(value, unit);
+}
+
+bool should_use_tui() {
+  return isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+}
+
+void enter_dump_tui() {
+  if (!should_use_tui()) {
+    return;
+  }
+  if (tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
+    termios raw = g_original_termios;
+    raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+      g_has_original_termios = true;
+    }
+  }
+  std::cout << neon::enter_alt_screen() << std::flush;
+  g_tui_active = true;
+}
+
+void leave_dump_tui() {
+  if (!g_tui_active.exchange(false)) {
+    return;
+  }
+  if (g_has_original_termios) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios);
+    g_has_original_termios = false;
+  }
+  std::cout << neon::leave_alt_screen() << std::flush;
 }
 
 void request_controls(uint32_t handle) {
@@ -261,10 +315,12 @@ void lidar_info_change_callback(const uint32_t handle, const LivoxLidarInfo* inf
     g_stats.handle = handle;
     g_stats.sn = info->sn;
     g_stats.lidar_ip = info->lidar_ip;
-    std::cout << "lidar: handle=" << handle
-              << " dev_type=" << static_cast<unsigned>(info->dev_type)
-              << " sn=" << info->sn
-              << " ip=" << info->lidar_ip << std::endl;
+    if (!g_tui_active.load()) {
+      std::cout << "lidar: handle=" << handle
+                << " dev_type=" << static_cast<unsigned>(info->dev_type)
+                << " sn=" << info->sn
+                << " ip=" << info->lidar_ip << std::endl;
+    }
   }
   request_controls(handle);
 }
@@ -306,6 +362,137 @@ void print_report(const Stats& previous, const Stats& now, double interval, doub
             << " imu_rate=" << std::setprecision(1) << (imu_delta / interval) << " sample/s"
             << " unsupported_packets=" << now.unsupported_packets
             << std::endl;
+}
+
+void handle_tui_input() {
+  if (!g_tui_active.load()) {
+    return;
+  }
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(STDIN_FILENO, &read_set);
+  timeval timeout {};
+  while (select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout) > 0) {
+    char ch = 0;
+    if (::read(STDIN_FILENO, &ch, 1) != 1) {
+      return;
+    }
+    if (ch == 3 || ch == 'q' || ch == 'Q') {
+      g_running = false;
+      g_cv.notify_all();
+      return;
+    }
+    FD_ZERO(&read_set);
+    FD_SET(STDIN_FILENO, &read_set);
+    timeout = timeval{};
+  }
+}
+
+std::vector<std::string> dump_identity_rows(const Stats& now, double elapsed) {
+  return {
+      "SERIAL_NO    " + neon::text(now.sn.empty() ? "N/A" : now.sn, neon::Color::Accent, true),
+      "IP_ADDRESS   " + neon::text(now.lidar_ip.empty() ? "N/A" : now.lidar_ip, now.lidar_ip.empty() ? neon::Color::Warning : neon::Color::Success, true),
+      "HANDLE       " + std::to_string(now.handle),
+      "UPTIME       " + neon::text(format_duration(elapsed), neon::Color::Accent, true),
+      "",
+      neon::badge("HEALTH", now.handle == 0 ? "WAIT" : "OK", now.handle == 0 ? neon::Color::Warning : neon::Color::Success),
+      neon::badge("MODE", "DUMP", neon::Color::Accent),
+      neon::badge("LASER", now.handle == 0 ? "WAIT" : "ACTIVE", now.handle == 0 ? neon::Color::Warning : neon::Color::Success),
+  };
+}
+
+std::vector<std::string> dump_output_rows(const Options& options) {
+  return {
+      "CONFIG       " + neon::fit(options.config_path, 54),
+      "POINTS_CSV   " + neon::fit(options.points_path, 54),
+      "IMU_CSV      " + (options.imu_path.empty() ? "disabled" : neon::fit(options.imu_path, 54)),
+      "DURATION     " + (options.duration_sec > 0.0 ? neon::fixed(options.duration_sec, 1) + "s" : "manual stop"),
+      "MAX_POINTS   " + (options.max_points > 0 ? std::to_string(options.max_points) : "unlimited"),
+  };
+}
+
+void print_tui_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
+  const neon::Size term = neon::terminal_size();
+  const int width = std::max(48, term.cols);
+  const uint64_t point_delta = now.points - previous.points;
+  const uint64_t packet_delta = now.point_packets - previous.point_packets;
+  const uint64_t imu_delta = now.imu_samples - previous.imu_samples;
+  const uint64_t imu_packet_delta = now.imu_packets - previous.imu_packets;
+  const double point_rate = point_delta / std::max(0.001, interval);
+  const double imu_rate = imu_delta / std::max(0.001, interval);
+  const double progress_by_time = g_options.duration_sec > 0.0 ? elapsed / g_options.duration_sec : 0.0;
+  const double progress_by_points = g_options.max_points > 0 ? static_cast<double>(now.points) / g_options.max_points : 0.0;
+  const double progress = g_options.duration_sec > 0.0 && g_options.max_points > 0
+      ? std::max(progress_by_time, progress_by_points)
+      : std::max(progress_by_time, progress_by_points);
+
+  std::ostringstream out;
+  out << neon::clear_screen()
+      << neon::header("LIVOX MID-360 DUMP", "CAPTURE", width);
+  int used_rows = 3;
+  if (term.rows < 16 || term.cols < 64) {
+    neon::append_line(out, neon::text("Terminal too small for Dump TUI", neon::Color::Warning, true), width, used_rows);
+    neon::append_line(out, "Resize to at least 64x16.", width, used_rows);
+    neon::append_line(out, "points=" + std::to_string(now.points) + " imu_samples=" + std::to_string(now.imu_samples), width, used_rows);
+    neon::append_footer_at_bottom(out, "[CTRL+C/Q] STOP", term.rows, width, used_rows);
+    std::cout << out.str() << std::flush;
+    return;
+  }
+
+  std::vector<std::string> metric_rows = {
+      "POINT_RATE   " + neon::text(format_compact_rate(point_rate, "pt/s"), point_rate > 0.0 ? neon::Color::Accent : neon::Color::Warning, true),
+      "POINT_PKTS   " + format_rate(packet_delta / std::max(0.001, interval), "pkt/s"),
+      "TOTAL_POINTS " + neon::text(std::to_string(now.points), neon::Color::Success, true),
+      "IMU_RATE     " + neon::text(format_rate(imu_rate, "sample/s"), imu_rate > 0.0 ? neon::Color::Success : neon::Color::Muted, true),
+      "IMU_PKTS     " + format_rate(imu_packet_delta / std::max(0.001, interval), "pkt/s"),
+      "TOTAL_IMU    " + std::to_string(now.imu_samples),
+      "UNSUPPORTED  " + std::to_string(now.unsupported_packets),
+  };
+  const int bar_width = std::max(8, width - 20);
+  std::vector<std::string> progress_rows = {
+      "ELAPSED      " + neon::text(format_duration(elapsed), neon::Color::Accent, true),
+      "PROGRESS     " + neon::text(neon::bar(progress, 1.0, bar_width, true), progress >= 1.0 ? neon::Color::Success : neon::Color::Accent, true),
+  };
+
+  if (term.cols >= 104) {
+    const int gap = 1;
+    const int left_w = neon::clamp_int(term.cols / 3, 33, 44);
+    const int right_w = std::max(58, term.cols - left_w - gap);
+    auto left = neon::box("DEVICE IDENTITY", dump_identity_rows(now, elapsed), left_w);
+    std::vector<std::string> right_rows = dump_output_rows(g_options);
+    right_rows.push_back("");
+    right_rows.insert(right_rows.end(), metric_rows.begin(), metric_rows.end());
+    right_rows.push_back("");
+    right_rows.insert(right_rows.end(), progress_rows.begin(), progress_rows.end());
+    auto right = neon::box("CAPTURE STREAM", right_rows, right_w);
+    for (const auto& row : neon::hstack(left, right, left_w, right_w, gap)) {
+      if (used_rows >= term.rows - 1) {
+        break;
+      }
+      neon::append_line(out, row, width, used_rows);
+    }
+  } else {
+    const auto identity = neon::box("DEVICE IDENTITY", dump_identity_rows(now, elapsed), width);
+    if (term.rows - used_rows - 1 >= static_cast<int>(identity.size()) + 4) {
+      neon::append_lines(out, identity, width, term.rows - used_rows - 1, used_rows);
+    }
+    std::vector<std::string> rows = dump_output_rows(g_options);
+    rows.push_back("");
+    rows.insert(rows.end(), metric_rows.begin(), metric_rows.end());
+    rows.push_back("");
+    rows.insert(rows.end(), progress_rows.begin(), progress_rows.end());
+    neon::append_lines(out, neon::box("CAPTURE STREAM", rows, width), width, term.rows - used_rows - 1, used_rows);
+  }
+  neon::append_footer_at_bottom(out, "[CTRL+C/Q] STOP", term.rows, width, used_rows);
+  std::cout << out.str() << std::flush;
+}
+
+void print_dump_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
+  if (g_tui_active.load()) {
+    print_tui_report(previous, now, interval, elapsed);
+  } else {
+    print_report(previous, now, interval, elapsed);
+  }
 }
 
 void usage(const char* argv0) {
@@ -412,12 +599,15 @@ int main(int argc, char** argv) {
     SetLivoxLidarInfoCallback(push_msg_callback, nullptr);
     SetLivoxLidarInfoChangeCallback(lidar_info_change_callback, nullptr);
 
-    std::cout << "config: " << g_options.config_path << "\n";
-    std::cout << "points_csv: " << g_options.points_path << "\n";
-    if (g_imu) {
-      std::cout << "imu_csv: " << g_options.imu_path << "\n";
+    enter_dump_tui();
+    if (!g_tui_active.load()) {
+      std::cout << "config: " << g_options.config_path << "\n";
+      std::cout << "points_csv: " << g_options.points_path << "\n";
+      if (g_imu) {
+        std::cout << "imu_csv: " << g_options.imu_path << "\n";
+      }
+      std::cout << "waiting for SDK callbacks; press Ctrl-C to stop." << std::endl;
     }
-    std::cout << "waiting for SDK callbacks; press Ctrl-C to stop." << std::endl;
 
     const auto started = std::chrono::steady_clock::now();
     auto last = started;
@@ -431,7 +621,8 @@ int main(int argc, char** argv) {
       Stats snapshot = g_stats;
       lock.unlock();
 
-      print_report(previous, snapshot, std::max(0.001, interval), elapsed);
+      handle_tui_input();
+      print_dump_report(previous, snapshot, std::max(0.001, interval), elapsed);
       previous = snapshot;
       last = now_time;
       if (g_options.duration_sec > 0.0 && elapsed >= g_options.duration_sec) {
@@ -444,10 +635,12 @@ int main(int argc, char** argv) {
     if (g_imu) {
       g_imu.flush();
     }
+    leave_dump_tui();
     std::cout << "stopped. wrote points=" << g_stats.points
               << " imu_samples=" << g_stats.imu_samples << std::endl;
     return 0;
   } catch (const std::exception& exc) {
+    leave_dump_tui();
     std::cerr << "ERROR: " << exc.what() << "\n";
     return 2;
   }

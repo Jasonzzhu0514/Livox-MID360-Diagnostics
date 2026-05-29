@@ -1,203 +1,159 @@
 # Livox MID360 Diagnostics
 
-用于检查 Livox MID360 是否可用：发现网卡上的雷达、修正 `MID360_config.json`，并查看实时数据。
+用于检查 Livox MID360 是否可用：发现网卡上的雷达、修正 `MID360_config.json`，并查看实时 SDK 数据状态。
 
 当前目标系统是 Ubuntu/Linux。Windows 原生环境未适配；需要 Windows 时建议使用 Linux 设备或 WSL2 评估网络可用性。
 
-## 选择版本
+## C++ CLI
 
-- Python CLI：发现雷达、更新 JSON、被动查看 UDP 包速率。适合快速配置和轻量检查。
-- C++ CLI：发现雷达、更新 JSON、Livox-SDK2 实时回调统计、点云/IMU CSV 导出。适合完整诊断。
-- GUI：计划作为 Qt 可视化诊断工具加入；当前还未实现。
+C++ CLI 是推荐主路径。它直接走 Livox-SDK2 discovery，不要求提前准备 `config/MID360_config.local.json`。
 
-官方依赖以 submodule 放在 `external/`，这里放的是上游源码，不是本项目自己的业务代码：
+### 准备
 
-- `external/livox_ros_driver2`
-- `external/Livox-SDK2`
+普通使用优先下载 GitHub Release 里的预编译包：
 
-本项目不再单独维护顶层 `third_party/`；C++ JSON 解析直接复用 `external/Livox-SDK2/3rdparty/rapidjson`。
+- 最新版本：<https://github.com/Jasonzzhu0514/Livox-MID360-Diagnostics/releases/latest>
 
-## 目录结构
+目标设备上可以自动下载当前架构的单文件启动器并运行：
 
-- `src/cpp/`：C++ CLI 源码。
-- `src/python/`：Python CLI 源码。
-- `scripts/`：构建、打包、清理和发布辅助脚本。
-- `docs/`：部署、发现逻辑和安全边界文档。
-- `examples/`：示例配置。
-- `external/`：上游 submodule 源码。
-- `dist/prebuilt/`：可发布的预编译包。
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+./livox_mid360_diagnostics
+```
+
+如果手动下载 Release 附件，选择当前架构的 `livox_mid360_diagnostics-linux-*`，然后执行：
+
+```bash
+mv ./livox_mid360_diagnostics-linux-* ./livox_mid360_diagnostics
+chmod +x ./livox_mid360_diagnostics
+./livox_mid360_diagnostics
+```
+
+这个单文件启动器会在首次运行时解出完整工具包，然后启动诊断入口。后续继续执行 `./livox_mid360_diagnostics` 即可。
+
+如果已经 clone 了本仓库，也可以运行：
+
+```bash
+bash scripts/use_cpp_release.sh
+./livox_mid360_diagnostics
+```
+
+需要从源码构建时再运行：
+
+```bash
+./scripts/setup_cpp.sh
+```
+
+如果要自己生成同架构预编译包：
+
+```bash
+./scripts/package_cpp_prebuilt.sh
+```
+
+### 常规诊断
+
+```bash
+./livox_mid360_diagnostics
+```
+
+启动后在菜单里选择：
+
+- `autoconfig`：发现雷达，搜索 MID360 配置文件，并选择要更新的 JSON。
+- `monitor`：通过 Livox-SDK2 发现雷达，显示实时点云/IMU 回调状态，适合常规验证和长期观察。
+- `dump`：短时抓取点云/IMU 到 CSV，适合留样或离线分析。
+
+如果是源码构建，使用 `./build/sdk2/livox_mid360_diagnostics`。
+
+需要脚本化运行或指定参数时，才直接加子命令。例如多网卡环境下指定扫描网卡：
+
+```bash
+./livox_mid360_diagnostics monitor --iface eth0
+```
+
+需要请求雷达进入 normal mode 并开启点云/IMU 发送时，确认设备连接正确且物理状态健康后再运行：
+
+```bash
+./livox_mid360_diagnostics monitor --set-normal-mode --enable-point-send --enable-imu
+```
+
+### 可选功能
+
+`dump` 可从菜单进入，也可以用命令行直接指定 CSV 输出。CSV 不适合长期记录；常规验证请用 `monitor`。
+
+```bash
+./livox_mid360_diagnostics dump --duration 10 --points "$PWD/mid360_points.csv" --imu "$PWD/mid360_imu.csv"
+```
+
+输出字段：
+
+- `mid360_points.csv`：`timestamp_ns, offset_s, x_m, y_m, z_m, reflectivity, tag` 等字段。
+- `mid360_imu.csv`：`timestamp_ns, offset_s, gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z` 等字段。
+
+需要图形化查看点云时，使用 `livox_ros_driver2` + RViz。`external/livox_ros_driver2` 只是源码 submodule，不等于已经构建好的 ROS 工作区。
 
 ## Python CLI
 
-一键准备：
+Python CLI 适合轻量配置和低层 UDP 端口检查。它不走 Livox-SDK2 callback，不向雷达发送 SDK 控制命令。
+
+### 准备
 
 ```bash
 ./scripts/setup_python.sh
 ```
 
-接入雷达并确认物理状态健康后：
+### 可用命令
 
 ```bash
 livox-mid360-diagnostics autoconfig
 livox-mid360-diagnostics udp-monitor
 ```
 
-含义：
-
-- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用带颜色的方向键菜单选择要更新的 JSON。
-- `udp-monitor`：被动监听配置里的 UDP 端口，查看是否收到数据。
-
-Python 版不会向雷达发送 SDK 控制命令。
-
-## C++ CLI
-
-如果目标设备不想拉 submodule、也不想编译 SDK，可以在同架构 Linux 设备上生成预编译包：
-
-```bash
-./scripts/package_cpp_prebuilt.sh
-```
-
-生成预编译包的机器需要 submodule；目标设备只需要拿到 `dist/prebuilt/*.tar.gz`，解压后运行：
-
-```bash
-source ./env.sh
-livox_mid360_diagnostics
-```
-
-如果是远程设备，先进入交互式 SSH：
-
-```bash
-ssh user@host
-cd livox-mid360-diagnostics-prebuilt
-source ./env.sh
-```
-
-一键准备：
-
-```bash
-./scripts/setup_cpp.sh
-```
-
-接入雷达并确认物理状态健康后：
-
-```bash
-./build/sdk2/livox_mid360_diagnostics autoconfig
-./build/sdk2/livox_mid360_diagnostics monitor
-./build/sdk2/livox_mid360_diagnostics dump --duration 10 --points "$PWD/mid360_points.csv" --imu "$PWD/mid360_imu.csv"
-```
-
-含义：
-
-- 直接运行 `livox_mid360_diagnostics`：显示 `autoconfig`、`monitor`、`dump`、`quit` 四个交互选项。
-- `autoconfig`：发现雷达，搜索 MID360 配置文件，并用带颜色的方向键菜单选择要更新的 JSON。
-- `monitor`：先通过 SDK 发现雷达，再显示单屏实时仪表盘，适合长时间观察。
-- `dump`：通过 Livox-SDK2 把短时间点云/IMU 样本解析到 CSV。
-
-需要请求雷达进入 normal mode 并开启数据发送时，再显式加控制参数：
-
-```bash
-./build/sdk2/livox_mid360_diagnostics monitor --set-normal-mode --enable-point-send --enable-imu
-```
-
-短时 CSV 导出也支持相同控制参数：
-
-```bash
-./build/sdk2/livox_mid360_diagnostics dump --duration 10 --points "$PWD/mid360_points.csv" --set-normal-mode --enable-point-send --enable-imu
-```
+- Python `autoconfig`：发现雷达并更新配置文件。非交互终端不会自动写文件，脚本化写入需要显式使用 `--config PATH --apply --yes`。
+- Python `udp-monitor`：只监听本机 UDP 端口是否收到包，不初始化 SDK，也不控制雷达。它需要从配置文件读取 `host_net_info` 端口。
 
 ## 配置文件
 
-`setup_python.sh` 和 `setup_cpp.sh` 会自动创建：
+主诊断流程不需要提前创建 `config/MID360_config.local.json`：
 
-```text
-config/MID360_config.local.json
-```
+- `autoconfig` 会先发现已连接雷达，再搜索和更新配置文件。
+- `monitor` 会根据本机网卡临时生成 SDK discovery 配置。
 
-`autoconfig` 会自动搜索当前目录和用户目录下的 MID360 配置文件，默认按“推荐更新 / 已匹配 / 其它候选”分组显示，并折叠示例、依赖和构建产物里的低优先级配置。使用上下方向键移动，空格选择/取消，`a` 显示或隐藏低优先级候选，回车确认，`q` 或 `Esc` 退出不修改。需要默认展示所有候选时可加 `--show-all`；需要纯文本输出时可加 `--no-color` 或设置 `NO_COLOR=1`。`dump` 会优先使用 `LIVOX_MID360_CONFIG` 指向的配置文件，你通常不需要手动传 `--config`。
+只有这些场景需要配置文件：
 
-C++ `monitor` 默认不再使用配置文件里的雷达 IP；它会先走 Livox-SDK2 发现，找到雷达后实时监听回调。如果多块网卡需要指定扫描网卡，可以使用：
+- 需要保存给 `livox_ros_driver2` 使用的 `MID360_config.json`。
+- 需要运行 C++ `dump`。
+- 需要运行 Python `udp-monitor`。
+- 需要显式指定 SDK 初始化配置。
 
-```bash
-./build/sdk2/livox_mid360_diagnostics monitor --iface eth0
-```
-
-如果要手动指定配置：
+手动指定配置：
 
 ```bash
 export LIVOX_MID360_CONFIG="/absolute/path/to/MID360_config.json"
 ```
 
-实际接雷达前，请确认 `MID360_config.local.json` 里的 `MID360.host_net_info` 与本机网卡 IP 匹配。
-
-## 实时数据
-
-Python `udp-monitor` 在终端显示 UDP 包速率和点数估计。它只监听本机端口，不控制雷达。
-
-C++ `monitor` 先发现雷达，再显示表格仪表盘，并在原位置刷新，不会持续刷出新行。通过非交互 SSH 或日志管道运行时，`monitor` 会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
-
-C++ `dump` 输出短时采样 CSV。MID360 点云数据量较大，CSV 是文本格式，不适合长期记录；长期观察请用 `monitor`。
-
-- `mid360_points.csv`：`timestamp_ns, x_m, y_m, z_m, reflectivity, tag` 等字段。
-- `mid360_imu.csv`：`timestamp_ns, gyro_x, gyro_y, gyro_z, acc_x, acc_y, acc_z` 等字段。
-
-需要图形化点云时，使用官方 `livox_ros_driver2` + RViz，或等待本项目后续 Qt GUI。
-
-## 离线验证
-
-这些命令不会连接雷达：
+生成本地配置模板：
 
 ```bash
-./scripts/check_offline.sh
-PYTHONPATH=src/python python3 -m unittest discover -s tests
+source scripts/prepare_config.sh
 ```
 
-## 清理工作区
+如果配置文件要给 ROS driver、`dump` 或 `udp-monitor` 使用，请确认 `MID360.host_net_info` 与本机网卡 IP 匹配。
 
-清理构建缓存并保留预编译包：
+## 远程部署
+
+远程设备建议进入交互式 SSH 后加载最新 C++ Release：
 
 ```bash
-./scripts/clean_workspace.sh
-```
-
-预编译包统一保留在：
-
-```text
-dist/prebuilt/
-```
-
-## 发布版本
-
-版本号由 `VERSION` 管理。当前版本：
-
-```text
-1.0.0
-```
-
-本地生成当前架构的 C++ 预编译包：
-
-```bash
-./scripts/package_cpp_prebuilt.sh
-```
-
-GitHub Release 由 tag 触发。发布 `Livox MID360 Diagnostics v1.0`：
-
-```bash
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Release workflow 会校验 `VERSION`、tag、`CHANGELOG.md` 和 `dist/prebuilt/` 里的预编译包是否一致，然后直接把预编译包上传为附件。当前 v1.0.0 已准备好两个附件：
-
-```text
-livox-mid360-diagnostics-cpp-1.0.0-linux-x86_64.tar.gz
-livox-mid360-diagnostics-cpp-1.0.0-linux-aarch64.tar.gz
+ssh user@host
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+./livox_mid360_diagnostics
 ```
 
 ## 安全边界
 
 - 没有接入健康雷达前，不要运行带 `--set-normal-mode --enable-point-send --enable-imu` 的命令。
-- Python `udp-monitor` 只监听本机 UDP 端口。
-- C++ `monitor` 和 `dump` 会初始化 Livox-SDK2；`monitor` 默认通过 SDK discovery 发现雷达，不读取 env 中的雷达 IP；只有显式加控制参数时才请求雷达切换模式或开启数据发送。
+- Python `udp-monitor` 只监听本机 UDP 端口，不初始化 SDK，不控制雷达。
+- C++ `monitor` 和 `dump` 会初始化 Livox-SDK2；只有显式加控制参数时才请求雷达切换模式或开启数据发送。
 - `external/livox_ros_driver2` 只是源码 submodule，不等于已经构建好的 ROS 工作区。
 
 ## 更多文档

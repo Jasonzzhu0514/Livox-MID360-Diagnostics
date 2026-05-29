@@ -51,6 +51,8 @@ jobs:
           REQUIRED=(
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
           )
 
           for asset in "${REQUIRED[@]}"; do
@@ -104,6 +106,8 @@ jobs:
           ASSETS=(
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
           )
 
           if gh release view "${TAG}" >/dev/null 2>&1; then

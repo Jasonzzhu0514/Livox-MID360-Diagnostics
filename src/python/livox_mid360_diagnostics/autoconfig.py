@@ -24,6 +24,11 @@ import tty
 from dataclasses import dataclass
 from pathlib import Path
 
+try:
+    from . import neon_tui as neon
+except ImportError:  # pragma: no cover - supports direct script execution.
+    import neon_tui as neon
+
 
 DISCOVERY_PORT = 56000
 LIVOX_MAC_PREFIXES = ("8c:58:23",)
@@ -36,6 +41,7 @@ MID360_CONFIG_KEYS = ("MID360", "Mid360s")
 
 SCREEN_ACTIVE = False
 SCAN_LINES: list[str] = []
+ORIGINAL_TERMIOS = None
 
 
 SDK_QUERY_MAIN_CPP = r'''
@@ -215,6 +221,8 @@ def discover_mid360_config_paths(verbose: bool = False) -> list[Path]:
     found: list[Path] = []
     seen: set[Path] = set()
     for root in config_search_roots():
+        if SCREEN_ACTIVE:
+            progress(f"searching config files under {root}")
         output = run_text(
             [
                 "find",
@@ -537,18 +545,28 @@ def verbose_print(enabled: bool, message: str) -> None:
         print(f"[debug] {message}", file=sys.stderr)
 
 
+def render_scan_screen(message: str | None = None) -> None:
+    if message:
+        SCAN_LINES.append(f"{neon.text('扫描', neon.ACCENT, True)} {message}")
+        del SCAN_LINES[:-128]
+    rows, cols = neon.terminal_size()
+    width = max(40, cols)
+    max_lines = max(3, rows - 8)
+    visible = SCAN_LINES[-max_lines:] or [f"{neon.text('扫描', neon.ACCENT, True)} preparing autoconfig"]
+    out = [neon.clear_screen(), neon.header("LIVOX MID-360 AUTOCONFIG", "SCAN", width)]
+    used_rows = 3
+    panel = neon.box("DISCOVERY TRACE", visible, width)
+    used_rows += neon.append_lines(out, panel, width, rows - used_rows - 1)
+    neon.append_footer_at_bottom(out, "[CTRL+C] STOP", rows, width, used_rows)
+    print("".join(out), end="")
+    sys.stdout.flush()
+
+
 def progress(message: str) -> None:
-    line = f"{cyan('扫描')} {message}"
     if SCREEN_ACTIVE:
-        SCAN_LINES.append(line)
-        del SCAN_LINES[:-8]
-        print("\033[H\033[2J", end="")
-        print(bold(blue("Livox MID360 Autoconfig")))
-        print(dim("=======================") + "\n")
-        for item in SCAN_LINES:
-            print(item)
-        sys.stdout.flush()
+        render_scan_screen(message)
     else:
+        line = f"{cyan('扫描')} {message}"
         print(line, flush=True)
 
 
@@ -1232,21 +1250,150 @@ def print_detection_summary(iface: str, result: Discovery) -> None:
     print(f"  detect_method:   {result.method or 'N/A'}")
 
 
+def detection_rows(iface: str, result: Discovery) -> list[str]:
+    return [
+        "IFACE        " + neon.text(iface or "N/A", neon.ACCENT, True),
+        "IFACE_IP     " + (result.iface_ip or "N/A"),
+        "LIDAR_IP     " + neon.text(result.lidar_ip or "N/A", neon.SUCCESS if result.lidar_ip else neon.DANGER, True),
+        "BROADCAST    " + (result.broadcast_code or "N/A"),
+        "ARP_HOST     " + (result.requested_host_ip or "N/A"),
+        "PACKETS      " + str(result.raw_packets),
+        "METHOD       " + (result.method or "N/A"),
+        "",
+        neon.badge("HEALTH", "FOUND" if result.lidar_ip else "WAIT", neon.SUCCESS if result.lidar_ip else neon.WARNING),
+        neon.badge("MODE", "AUTOCONFIG", neon.ACCENT),
+    ]
+
+
+def status_plain(status: str) -> str:
+    if status == "mismatch":
+        return "UPDATE"
+    if status == "match":
+        return "MATCH"
+    if status == "unavailable":
+        return "NO-IP"
+    return status or "N/A"
+
+
+def status_color(status: str) -> str:
+    if status == "mismatch":
+        return neon.WARNING
+    if status == "match":
+        return neon.SUCCESS
+    if status == "unavailable":
+        return neon.MUTED
+    return neon.TEXT
+
+
+def visible_group_labels(view: ConfigView) -> list[str]:
+    return ["推荐更新"] * len(view.recommended) + ["已匹配"] * len(view.matched) + ["其它候选"] * len(view.other)
+
+
+def render_candidate_rows(
+    visible_states: list[ConfigState],
+    labels: list[str],
+    selected: list[bool],
+    cursor: int,
+    first: int,
+    max_rows: int,
+    width: int,
+) -> list[str]:
+    rows = ["上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。", ""]
+    path_width = max(10, width - 39)
+    for index in range(first, len(visible_states)):
+        if len(rows) >= max_rows + 2:
+            break
+        state = visible_states[index]
+        checked = state.original_index < len(selected) and selected[state.original_index]
+        marker = neon.text("▶", neon.ACCENT, True) if index == cursor else " "
+        check = neon.text("[x]", neon.SUCCESS, True) if checked else "[ ]"
+        group = neon.text(neon.pad_right(labels[index] if index < len(labels) else "候选", 8), neon.MUTED, True)
+        status = neon.text(neon.pad_right(status_plain(state.status), 7), status_color(state.status), True)
+        rows.append(
+            f"{marker} {check} {neon.pad_left(str(index + 1), 2)} {group} {status} "
+            f"{neon.fit(compact_path(state.path, path_width), path_width)}"
+        )
+    if not visible_states:
+        rows.append(neon.text("当前可见列表为空。", neon.WARNING, True))
+    return rows
+
+
+def render_config_picker(
+    config_states: list[ConfigState],
+    iface: str,
+    result: Discovery,
+    show_all: bool,
+    cursor: int,
+    selected: list[bool],
+) -> str:
+    view = make_config_view(config_states, show_all)
+    visible_states = flatten_config_view(view)
+    labels = visible_group_labels(view)
+    rows, cols = neon.terminal_size()
+    width = max(48, cols)
+    out = [neon.clear_screen(), neon.header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width)]
+    used_rows = 3
+    if rows < 16 or cols < 58:
+        used_rows += neon.append_line(out, neon.text("Terminal too small for Autoconfig TUI", neon.WARNING, True), width)
+        used_rows += neon.append_line(out, "Resize to at least 58x16.", width)
+        neon.append_footer_at_bottom(out, "[ENTER] APPLY   [Q/ESC] QUIT", rows, width, used_rows)
+        return "".join(out)
+
+    selected_count = sum(1 for item in selected if item)
+    selection_line = f"VISIBLE {len(visible_states)} / TOTAL {len(config_states)} / SELECTED {selected_count}"
+    hidden_line = "LOW PRIORITY shown" if view.hidden_count == 0 else f"LOW PRIORITY folded: {view.hidden_count} (press a)"
+
+    if cols >= 104:
+        left_w = min(44, max(33, cols // 3))
+        right_w = max(58, cols - left_w - 1)
+        max_candidate_rows = max(1, rows - used_rows - 6)
+        first = max(0, cursor - max_candidate_rows + 1) if visible_states and cursor >= max_candidate_rows else 0
+        left_rows = [*detection_rows(iface, result), "", selection_line, hidden_line]
+        right_rows = render_candidate_rows(visible_states, labels, selected, cursor, first, max_candidate_rows, right_w)
+        used_rows += neon.append_lines(
+            out,
+            neon.hstack(neon.box("DEVICE IDENTITY", left_rows, left_w), neon.box("CONFIG CANDIDATES", right_rows, right_w), left_w, right_w),
+            width,
+            rows - used_rows - 2,
+        )
+    else:
+        top_rows = detection_rows(iface, result)[: min(7, max(3, rows // 4))]
+        top_rows.extend([selection_line, hidden_line])
+        identity_lines = neon.box("DEVICE IDENTITY", top_rows, width)
+        if rows - used_rows - 2 >= len(identity_lines) + 5:
+            used_rows += neon.append_lines(out, identity_lines, width, rows - used_rows - 2)
+        max_candidate_rows = max(1, rows - used_rows - 6)
+        first = max(0, cursor - max_candidate_rows + 1) if visible_states and cursor >= max_candidate_rows else 0
+        right_rows = render_candidate_rows(visible_states, labels, selected, cursor, first, max_candidate_rows, width)
+        used_rows += neon.append_lines(out, neon.box("CONFIG CANDIDATES", right_rows, width), width, rows - used_rows - 2)
+
+    if visible_states and used_rows < rows - 1:
+        used_rows += neon.append_line(out, neon.text("PATH ", neon.MUTED, True) + neon.fit(str(visible_states[cursor].path), max(8, width - 5)), width)
+    neon.append_footer_at_bottom(out, "[↑/↓] MOVE   [SPACE] SELECT   [A] LOW-PRIORITY   [ENTER] APPLY   [Q/ESC] QUIT", rows, width, used_rows)
+    return "".join(out)
+
+
 def enter_screen() -> None:
-    global SCREEN_ACTIVE
+    global SCREEN_ACTIVE, ORIGINAL_TERMIOS
     if not sys.stdout.isatty():
         return
-    print("\033[?1049h\033[?25l\033[H\033[2J", end="")
+    if sys.stdin.isatty() and ORIGINAL_TERMIOS is None:
+        ORIGINAL_TERMIOS = termios.tcgetattr(sys.stdin.fileno())
+        tty.setcbreak(sys.stdin.fileno())
+    print(neon.enter_alt_screen(), end="")
     sys.stdout.flush()
     SCREEN_ACTIVE = True
 
 
 def leave_screen() -> None:
-    global SCREEN_ACTIVE
+    global SCREEN_ACTIVE, ORIGINAL_TERMIOS
     if not SCREEN_ACTIVE:
         return
     SCREEN_ACTIVE = False
-    print("\033[?25h\033[?1049l", end="")
+    if ORIGINAL_TERMIOS is not None:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, ORIGINAL_TERMIOS)
+        ORIGINAL_TERMIOS = None
+    print(neon.leave_alt_screen(), end="")
     sys.stdout.flush()
 
 
@@ -1258,12 +1405,13 @@ def choose_configs_interactively(
 ) -> list[int]:
     if not config_states:
         if SCREEN_ACTIVE:
-            print("\033[H\033[2J", end="")
-            print(bold(blue("Livox MID360 Autoconfig")))
-            print(dim("=======================") + "\n")
-            print_detection_summary(iface, result)
-            print("\n可更新的 MID360 配置文件：")
-            print("  未发现带有雷达 IP 的配置文件。")
+            rows, cols = neon.terminal_size()
+            print(neon.clear_screen(), end="")
+            print(neon.header("LIVOX MID-360 AUTOCONFIG", "CONFIG", max(40, cols)), end="")
+            panel_rows = [*detection_rows(iface, result), "", neon.text("未发现带有雷达 IP 的配置文件。", neon.WARNING, True)]
+            for line in neon.box("DEVICE IDENTITY", panel_rows, max(40, cols)):
+                print(line)
+            print(neon.footer("[Q/ESC] QUIT", max(40, cols)))
         else:
             print_detection_summary(iface, result)
             print_config_table(config_states, initial_show_all)
@@ -1286,22 +1434,7 @@ def choose_configs_interactively(
             cursor = 0
         elif cursor >= len(visible_states):
             cursor = len(visible_states) - 1
-        print("\033[H\033[2J", end="")
-        print(bold(blue("Livox MID360 Autoconfig")))
-        print(dim("=======================") + "\n")
-        print_detection_summary(iface, result)
-        print(f"\n{bold('选择要更新的 MID360 配置文件')}")
-        print(dim("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。"))
-        view = make_config_view(config_states, show_all)
-        index = 0
-        index = print_config_section("推荐更新", view.recommended, index, cursor, selected)
-        index = print_config_section("已匹配", view.matched, index, cursor, selected)
-        index = print_config_section("其它候选", view.other, index, cursor, selected)
-        if index == 0:
-            print("\n  当前可见列表为空。")
-        print_hidden_hint(view.hidden_count)
-        if visible_states:
-            print(f"\n{dim('完整路径: ' + str(visible_states[cursor].path))}")
+        print(render_config_picker(config_states, iface, result, show_all, cursor, selected), end="")
         sys.stdout.flush()
 
     def read_char(timeout: float | None = None) -> str:
@@ -1344,8 +1477,9 @@ def choose_configs_interactively(
                 break
             redraw()
     finally:
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, original)
-        print("\033[H\033[2J", end="")
+        if ORIGINAL_TERMIOS is None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, original)
+        print(neon.clear_screen(), end="")
 
     if cancelled:
         return []
@@ -1415,9 +1549,11 @@ def main() -> int:
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args()
     init_theme(args.no_color)
+    neon.set_color_enabled(not args.no_color)
     interactive_picker = not args.apply and sys.stdin.isatty() and sys.stdout.isatty()
     if interactive_picker:
         enter_screen()
+        render_scan_screen("preparing config search")
     config_paths = resolve_config_paths(args.config, verbose=args.verbose)
     ifaces = candidate_ifaces(args.iface, config_paths)
     progress("starting MID360 discovery")
@@ -1542,4 +1678,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        leave_screen()
+        print("Interrupted.", file=sys.stderr)
+        raise SystemExit(130)
