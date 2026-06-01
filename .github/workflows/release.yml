@@ -42,7 +42,7 @@ jobs:
             tar
 
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           submodules: recursive
@@ -72,7 +72,7 @@ jobs:
           "${BINARY}" --help
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: prebuilt-${{ matrix.arch }}
           path: |
@@ -88,7 +88,7 @@ jobs:
     needs: build-prebuilt
     steps:
       - name: 检出仓库
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -112,7 +112,7 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: 下载预编译产物
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/prebuilt
           merge-multiple: true
