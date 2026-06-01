@@ -7,6 +7,7 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <termios.h>
 
 #ifdef LIVOX_MID360_HAS_NCURSES
 #include <locale.h>
@@ -163,6 +164,8 @@ std::atomic<bool> g_terminal_active{false};
 std::atomic<bool> g_internal_query_inflight{false};
 std::chrono::steady_clock::time_point g_internal_query_started;
 std::vector<std::string> g_discovery_lines;
+termios g_original_termios {};
+bool g_has_original_termios = false;
 #ifdef LIVOX_MID360_HAS_NCURSES
 std::atomic<bool> g_curses_active{false};
 #endif
@@ -189,6 +192,10 @@ enum ColorPair {
 };
 
 bool inherited_terminal_dashboard();
+void leave_terminal_dashboard();
+void print_discovery_dashboard(const std::string& message = "");
+void discovery_log(const std::string& message, bool important = false);
+std::string fixed_number(double value, int precision);
 
 bool valid_ipv4(const std::string& ip) {
   in_addr addr {};
@@ -341,10 +348,38 @@ void enter_terminal_dashboard() {
   g_terminal_active = true;
   return;
 #else
+  if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
+    termios noecho = g_original_termios;
+    noecho.c_lflag &= static_cast<unsigned>(~ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &noecho) == 0) {
+      g_has_original_termios = true;
+    }
+  }
   std::cout << (inherited_terminal_dashboard() ? "" : "\033[?1049h")
+            << "\033[?1000l\033[?1002l\033[?1003l\033[?1006l"
             << "\033[?25l\033[48;5;233m\033[38;5;252m\033[2J\033[H" << std::flush;
   g_terminal_active = true;
 #endif
+}
+
+void enter_discovery_dashboard() {
+  if (!isatty(STDOUT_FILENO)) {
+    return;
+  }
+  if (g_terminal_active.load()) {
+    return;
+  }
+  if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
+    termios noecho = g_original_termios;
+    noecho.c_lflag &= static_cast<unsigned>(~ECHO);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &noecho) == 0) {
+      g_has_original_termios = true;
+    }
+  }
+  std::cout << (inherited_terminal_dashboard() ? "" : "\033[?1049h")
+            << "\033[?1000l\033[?1002l\033[?1003l\033[?1006l"
+            << "\033[?25l\033[48;5;233m\033[38;5;252m\033[2J\033[H" << std::flush;
+  g_terminal_active = true;
 }
 
 void leave_terminal_dashboard() {
@@ -356,7 +391,11 @@ void leave_terminal_dashboard() {
     endwin();
   }
 #else
-  std::cout << "\033[?25h\033[?1049l" << std::flush;
+  if (g_has_original_termios) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios);
+    g_has_original_termios = false;
+  }
+  std::cout << "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h\033[?1049l" << std::flush;
 #endif
 }
 
@@ -368,10 +407,6 @@ bool inherited_terminal_dashboard() {
   const char* value = std::getenv("LIVOX_MID360_ALT_SCREEN");
   return value && std::strcmp(value, "1") == 0;
 }
-
-void print_discovery_dashboard(const std::string& message = "");
-void discovery_log(const std::string& message, bool important = false);
-std::string fixed_number(double value, int precision);
 
 void AsyncControlCallback(livox_status status, uint32_t handle, LivoxLidarAsyncControlResponse* response, void*) {
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -446,6 +481,7 @@ bool json_int_value(const std::string& text, const std::string& key, int& value)
     value = std::stoi(match[1].str());
     return true;
   }
+  discovery_log("ERROR: no MID360 lidar found by SDK discovery", true);
   return false;
 }
 
@@ -2077,30 +2113,6 @@ void print_discovery_dashboard(const std::string& message) {
   if (!terminal_dashboard_active()) {
     return;
   }
-#ifdef LIVOX_MID360_HAS_NCURSES
-  if (g_curses_active.load()) {
-    erase();
-    bkgd(COLOR_PAIR(kColorBackground));
-    draw_header(std::chrono::system_clock::now());
-    draw_box(3, 0, std::max(6, LINES - 4), COLS, "DISCOVERY");
-    const int max_rows = std::max(1, LINES - 8);
-    const int start = std::max(0, static_cast<int>(g_discovery_lines.size()) - max_rows);
-    for (int i = start; i < static_cast<int>(g_discovery_lines.size()); ++i) {
-      put_text(
-          5 + i - start,
-          2,
-          g_discovery_lines[static_cast<size_t>(i)],
-          kColorText,
-          i == static_cast<int>(g_discovery_lines.size()) - 1);
-    }
-    if (!message.empty()) {
-      put_text(LINES - 3, 2, message, kColorAccent, true);
-    }
-    draw_footer(LINES - 1);
-    refresh();
-    return;
-  }
-#endif
   const TerminalSize term = current_terminal_size();
   std::ostringstream out;
   const int width = std::max(40, term.cols);
@@ -2163,6 +2175,106 @@ void discovery_log(const std::string& message, bool important) {
   } else {
     std::cout << "discovery: " << message << std::endl;
   }
+}
+
+void handle_terminal_input() {
+#ifdef LIVOX_MID360_HAS_NCURSES
+  if (g_curses_active.load()) {
+    int key = getch();
+    while (key != ERR) {
+      if (key == 3 || key == 'q' || key == 'Q') {
+        g_running = false;
+        g_cv.notify_all();
+      } else if (key == KEY_F(5)) {
+        g_reset_requested = true;
+      }
+      key = getch();
+    }
+  }
+#endif
+}
+
+void wait_for_result_key() {
+  if (!isatty(STDIN_FILENO)) {
+    return;
+  }
+#ifdef LIVOX_MID360_HAS_NCURSES
+  if (g_curses_active.load()) {
+    nodelay(stdscr, FALSE);
+    while (true) {
+      const int key = getch();
+      if (key == '\n' || key == '\r' || key == 'q' || key == 'Q' || key == 27) {
+        break;
+      }
+    }
+    nodelay(stdscr, TRUE);
+    return;
+  }
+#endif
+  termios original {};
+  if (tcgetattr(STDIN_FILENO, &original) != 0) {
+    return;
+  }
+  termios raw = original;
+  raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+    return;
+  }
+  char ch = 0;
+  while (::read(STDIN_FILENO, &ch, 1) == 1) {
+    if (ch == '\n' || ch == '\r' || ch == 'q' || ch == 'Q' || ch == '\033') {
+      break;
+    }
+  }
+  tcsetattr(STDIN_FILENO, TCSANOW, &original);
+}
+
+void print_discovery_error_screen(const std::string& title, const std::string& message) {
+  if (!terminal_dashboard_active()) {
+    std::cerr << "ERROR: " << message << "\n";
+    return;
+  }
+  const TerminalSize term = current_terminal_size();
+  const int screen_rows = std::max(10, term.rows);
+  const int width = std::max(58, term.cols);
+  int used_rows = 3;
+  std::ostringstream out;
+  out << "\033[48;5;233m\033[38;5;252m\033[2J\033[H"
+      << ansi_text("📡 LIVOX MID-360 [" + title + "]", 4, true)
+      << std::string(std::max(1, width - 42 - static_cast<int>(title.size())), ' ')
+      << ansi_text(format_short_clock_time(std::chrono::system_clock::now()) + "  ⚙", 6)
+      << "\n"
+      << ansi_text(repeat_text("─", width), 1)
+      << "\n"
+      << ansi_text(repeat_text("─", width), 4)
+      << "\n";
+  std::vector<std::string> status_rows = {
+      "STATUS       " + ansi_text("[STATE: ERROR]", 4, true),
+      "MESSAGE      " + ansi_text(message, 4, true),
+      "",
+      "No live MID360 callback was observed during SDK discovery.",
+      "Check lidar power, Ethernet link, host IP/subnet, and firewall.",
+  };
+  append_lines_fit(out, boxed_lines("DISCOVERY RESULT", status_rows, width), used_rows, screen_rows - 2);
+  const int max_rows = std::max(3, screen_rows - used_rows - 4);
+  std::vector<std::string> trace_rows;
+  const size_t begin = g_discovery_lines.size() > static_cast<size_t>(max_rows)
+      ? g_discovery_lines.size() - static_cast<size_t>(max_rows)
+      : 0;
+  for (size_t i = begin; i < g_discovery_lines.size(); ++i) {
+    trace_rows.push_back(g_discovery_lines[i]);
+  }
+  append_lines_fit(out, boxed_lines("LAST TRACE", trace_rows, width), used_rows, screen_rows - 1);
+  while (used_rows++ < screen_rows - 1) {
+    out << neon::blank_line(width) << "\n";
+  }
+  out << "\033[48;5;51m\033[30;1m"
+      << ansi_pad_right(" [ENTER/Q/ESC] EXIT ", width)
+      << "\033[0m";
+  std::cout << out.str() << std::flush;
+  wait_for_result_key();
 }
 
 void print_cell(std::ostream& out, const std::string& value, int width) {
@@ -2265,12 +2377,20 @@ void register_sdk_callbacks(Options& options) {
 }
 
 bool wait_for_lidar(double timeout_sec) {
-  std::unique_lock<std::mutex> lock(g_mutex);
-  return g_cv.wait_for(
-      lock,
-      std::chrono::milliseconds(static_cast<int>(timeout_sec * 1000.0)),
-      [] { return !g_running.load() || g_seen_lidar.load(); }) &&
-      g_seen_lidar.load();
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(static_cast<int>(timeout_sec * 1000.0));
+  auto next_repaint = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  while (g_running.load() && !g_seen_lidar.load() && std::chrono::steady_clock::now() < deadline) {
+    handle_terminal_input();
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= next_repaint) {
+      print_discovery_dashboard("");
+      next_repaint = now + std::chrono::milliseconds(250);
+    }
+    std::unique_lock<std::mutex> lock(g_mutex);
+    g_cv.wait_for(lock, std::chrono::milliseconds(100));
+  }
+  return g_seen_lidar.load();
 }
 
 std::string describe_candidate(const InterfaceInfo& iface) {
@@ -2807,7 +2927,7 @@ int main(int argc, char** argv) {
     }
 
     if (options.config_path.empty()) {
-      enter_terminal_dashboard();
+      enter_discovery_dashboard();
       if (terminal_dashboard_active()) {
         print_discovery_dashboard("waiting for Livox-SDK2 discovery");
       }
@@ -2816,7 +2936,12 @@ int main(int argc, char** argv) {
     InterfaceInfo active_iface;
     if (!options.config_path.empty()) {
       if (!init_sdk_with_config(options)) {
-        std::cerr << "ERROR: LivoxLidarSdkInit failed for " << options.config_path << "\n";
+        if (terminal_dashboard_active()) {
+          print_discovery_error_screen("SDK ERROR", "LivoxLidarSdkInit failed for " + options.config_path);
+          leave_terminal_dashboard();
+        } else {
+          std::cerr << "ERROR: LivoxLidarSdkInit failed for " << options.config_path << "\n";
+        }
         LivoxLidarSdkUninit();
         return 2;
       }
@@ -2824,7 +2949,21 @@ int main(int argc, char** argv) {
       std::cout << "config: " << options.config_path << std::endl;
     } else {
       if (!init_sdk_by_discovery(options, active_iface)) {
-        std::cerr << "ERROR: no MID360 lidar found by SDK discovery\n";
+        if (!g_running.load()) {
+          if (terminal_dashboard_active()) {
+            print_discovery_error_screen("INTERRUPTED", "SDK discovery was interrupted");
+            leave_terminal_dashboard();
+          } else {
+            std::cerr << "Interrupted.\n";
+          }
+          return 130;
+        }
+        if (terminal_dashboard_active()) {
+          print_discovery_error_screen("NOT FOUND", "no MID360 lidar found by SDK discovery");
+          leave_terminal_dashboard();
+        } else {
+          std::cerr << "ERROR: no MID360 lidar found by SDK discovery\n";
+        }
         return 2;
       }
       sdk.initialized = true;
@@ -2923,8 +3062,13 @@ int main(int argc, char** argv) {
     }
     return 0;
   } catch (const std::exception& exc) {
+    if (terminal_dashboard_active()) {
+      print_discovery_error_screen("ERROR", exc.what());
+    }
     leave_terminal_dashboard();
-    std::cerr << "ERROR: " << exc.what() << "\n";
+    if (!isatty(STDOUT_FILENO)) {
+      std::cerr << "ERROR: " << exc.what() << "\n";
+    }
     return 2;
   }
 }

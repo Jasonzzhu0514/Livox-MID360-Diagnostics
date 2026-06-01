@@ -12,6 +12,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef LIVOX_MID360_DIAGNOSTICS_VERSION
@@ -30,6 +31,16 @@ struct MenuItem {
   std::string command;
   std::string description;
   std::string badge;
+};
+
+enum class MenuKey {
+  Unknown,
+  None,
+  Enter,
+  Quit,
+  Escape,
+  Up,
+  Down,
 };
 
 void usage(const char* argv0) {
@@ -127,6 +138,52 @@ std::string render_menu(const std::array<MenuItem, 4>& items, size_t cursor) {
   return out.str();
 }
 
+bool read_char_timeout(char& out, int timeout_ms) {
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(STDIN_FILENO, &read_set);
+  timeval timeout {};
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
+  return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
+}
+
+MenuKey read_menu_key() {
+  char ch = 0;
+  if (!read_char_timeout(ch, 0)) {
+    return MenuKey::None;
+  }
+  if (ch == '\n' || ch == '\r') {
+    return MenuKey::Enter;
+  }
+  if (ch == 'q' || ch == 'Q') {
+    return MenuKey::Quit;
+  }
+  if (ch != '\033') {
+    return MenuKey::Unknown;
+  }
+
+  char prefix = 0;
+  if (!read_char_timeout(prefix, 150)) {
+    return MenuKey::Escape;
+  }
+  if (prefix != '[' && prefix != 'O') {
+    return MenuKey::Unknown;
+  }
+  char code = 0;
+  if (!read_char_timeout(code, 150)) {
+    return MenuKey::Unknown;
+  }
+  if (code == 'A') {
+    return MenuKey::Up;
+  }
+  if (code == 'B') {
+    return MenuKey::Down;
+  }
+  return MenuKey::Unknown;
+}
+
 std::string choose_command_menu() {
   const std::array<MenuItem, 4> items = {{
       {"autoconfig", "发现雷达并选择要更新的配置文件", "CONFIG"},
@@ -159,41 +216,22 @@ std::string choose_command_menu() {
     std::cout << render_menu(items, cursor);
     std::cout.flush();
   };
-  auto read_char_timeout = [](char& out, int timeout_ms) {
-    fd_set read_set;
-    FD_ZERO(&read_set);
-    FD_SET(STDIN_FILENO, &read_set);
-    timeval timeout {};
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
-    return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
-  };
 
   std::cout << neon::enter_alt_screen() << std::flush;
   redraw();
   while (!done) {
-    char ch = 0;
-    if (::read(STDIN_FILENO, &ch, 1) != 1) {
-      cursor = items.size() - 1;
-      break;
-    }
-    if (ch == '\033') {
-      char left = 0;
-      char right = 0;
-      if (read_char_timeout(left, 50) && read_char_timeout(right, 50) && left == '[') {
-        if (right == 'A') {
-          cursor = cursor == 0 ? items.size() - 1 : cursor - 1;
-        } else if (right == 'B') {
-          cursor = (cursor + 1) % items.size();
-        }
-      } else {
-        cursor = items.size() - 1;
-        done = true;
-      }
-    } else if (ch == '\n' || ch == '\r') {
+    const MenuKey key = read_menu_key();
+    if (key == MenuKey::None) {
+      redraw();
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    } else if (key == MenuKey::Up) {
+      cursor = cursor == 0 ? items.size() - 1 : cursor - 1;
+    } else if (key == MenuKey::Down) {
+      cursor = (cursor + 1) % items.size();
+    } else if (key == MenuKey::Enter) {
       done = true;
-    } else if (ch == 'q' || ch == 'Q') {
+    } else if (key == MenuKey::Quit || key == MenuKey::Escape) {
       cursor = items.size() - 1;
       done = true;
     }
@@ -205,6 +243,57 @@ std::string choose_command_menu() {
   tcsetattr(STDIN_FILENO, TCSANOW, &original);
   std::cout << neon::leave_alt_screen() << std::flush;
   return selected;
+}
+
+void wait_for_exit_key() {
+  if (!isatty(STDIN_FILENO)) {
+    return;
+  }
+  termios original {};
+  if (tcgetattr(STDIN_FILENO, &original) != 0) {
+    return;
+  }
+  termios raw = original;
+  raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+    return;
+  }
+  while (true) {
+    const MenuKey key = read_menu_key();
+    if (key == MenuKey::Enter || key == MenuKey::Quit || key == MenuKey::Escape) {
+      break;
+    }
+  }
+  tcsetattr(STDIN_FILENO, TCSANOW, &original);
+}
+
+void show_error_screen(const std::string& title, const std::vector<std::string>& messages) {
+  if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+    for (const auto& message : messages) {
+      std::cerr << "ERROR: " << message << "\n";
+    }
+    return;
+  }
+  const neon::Size term = neon::terminal_size();
+  const int rows = std::max(10, term.rows);
+  const int width = std::max(58, term.cols);
+  int used_rows = 3;
+  std::ostringstream out;
+  out << neon::enter_alt_screen()
+      << neon::clear_screen()
+      << neon::header("LIVOX MID-360 DIAGNOSTICS", title, width);
+  std::vector<std::string> status_rows = {
+      "STATUS       " + neon::badge("STATE", "ERROR", neon::Color::Danger),
+      "",
+  };
+  status_rows.insert(status_rows.end(), messages.begin(), messages.end());
+  neon::append_lines(out, neon::box("COMMAND RESULT", status_rows, width), width, rows - used_rows - 1, used_rows);
+  neon::append_footer_at_bottom(out, "[ENTER/Q/ESC] EXIT", rows, width, used_rows);
+  std::cout << out.str() << std::flush;
+  wait_for_exit_key();
+  std::cout << neon::leave_alt_screen() << std::flush;
 }
 
 bool has_config_arg(const std::vector<std::string>& args) {
@@ -291,8 +380,7 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (!known_command(command)) {
-    std::cerr << "ERROR: unknown command: " << command << "\n";
-    usage(argv[0]);
+    show_error_screen("ERROR", {"unknown command: " + command});
     return 2;
   }
 
@@ -318,8 +406,13 @@ int main(int argc, char** argv) {
     child_args.push_back("--config");
     child_args.push_back("config/MID360_config.local.json");
   } else if (needs_config && !has_config_arg(child_args)) {
-    std::cerr << "ERROR: dump needs a MID360_config.json path.\n"
-              << "Use monitor for normal validation, or pass --config PATH / set LIVOX_MID360_CONFIG before dumping CSV.\n";
+    show_error_screen(
+        "DUMP",
+        {
+            "dump needs a MID360_config.json path.",
+            "Use monitor for normal validation.",
+            "For CSV dump, pass --config PATH or set LIVOX_MID360_CONFIG.",
+        });
     return 2;
   }
 

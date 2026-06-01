@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -67,6 +68,11 @@ bool g_has_original_termios = false;
 void stop(int) {
   g_running = false;
   g_cv.notify_all();
+}
+
+bool regular_file_exists(const std::string& path) {
+  struct stat info {};
+  return stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
 }
 
 uint64_t packet_timestamp_ns(const LivoxLidarEthernetPacket* packet) {
@@ -388,6 +394,30 @@ void handle_tui_input() {
   }
 }
 
+void wait_for_exit_key() {
+  if (!isatty(STDIN_FILENO)) {
+    return;
+  }
+  termios original {};
+  if (tcgetattr(STDIN_FILENO, &original) != 0) {
+    return;
+  }
+  termios raw = original;
+  raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+    return;
+  }
+  char ch = 0;
+  while (::read(STDIN_FILENO, &ch, 1) == 1) {
+    if (ch == '\n' || ch == '\r' || ch == 'q' || ch == 'Q' || ch == '\033') {
+      break;
+    }
+  }
+  tcsetattr(STDIN_FILENO, TCSANOW, &original);
+}
+
 std::vector<std::string> dump_identity_rows(const Stats& now, double elapsed) {
   return {
       "SERIAL_NO    " + neon::text(now.sn.empty() ? "N/A" : now.sn, neon::Color::Accent, true),
@@ -409,6 +439,32 @@ std::vector<std::string> dump_output_rows(const Options& options) {
       "DURATION     " + (options.duration_sec > 0.0 ? neon::fixed(options.duration_sec, 1) + "s" : "manual stop"),
       "MAX_POINTS   " + (options.max_points > 0 ? std::to_string(options.max_points) : "unlimited"),
   };
+}
+
+void print_dump_error_screen(const std::string& message) {
+  if (!g_tui_active.load()) {
+    std::cerr << "ERROR: " << message << "\n";
+    return;
+  }
+  const neon::Size term = neon::terminal_size();
+  const int rows = std::max(10, term.rows);
+  const int width = std::max(58, term.cols);
+  int used_rows = 3;
+  std::ostringstream out;
+  out << neon::clear_screen()
+      << neon::header("LIVOX MID-360 DUMP", "ERROR", width);
+  std::vector<std::string> status_rows = {
+      "STATUS       " + neon::badge("STATE", "ERROR", neon::Color::Danger),
+      "MESSAGE      " + neon::text(message, neon::Color::Danger, true),
+      "",
+      "CONFIG       " + (g_options.config_path.empty() ? "N/A" : g_options.config_path),
+      "POINTS_CSV   " + (g_options.points_path.empty() ? "N/A" : g_options.points_path),
+      "IMU_CSV      " + (g_options.imu_path.empty() ? "N/A" : g_options.imu_path),
+  };
+  neon::append_lines(out, neon::box("CAPTURE RESULT", status_rows, width), width, rows - used_rows - 1, used_rows);
+  neon::append_footer_at_bottom(out, "[ENTER/Q/ESC] EXIT", rows, width, used_rows);
+  std::cout << out.str() << std::flush;
+  wait_for_exit_key();
 }
 
 void print_tui_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
@@ -572,6 +628,10 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, stop);
     std::signal(SIGTERM, stop);
 
+    if (!regular_file_exists(g_options.config_path)) {
+      throw std::runtime_error("config file not found: " + g_options.config_path);
+    }
+
     g_points.open(g_options.points_path, std::ios::out | std::ios::trunc);
     if (!g_points) {
       throw std::runtime_error("failed to open point output: " + g_options.points_path);
@@ -640,8 +700,16 @@ int main(int argc, char** argv) {
               << " imu_samples=" << g_stats.imu_samples << std::endl;
     return 0;
   } catch (const std::exception& exc) {
+    if (should_use_tui() && !g_tui_active.load()) {
+      enter_dump_tui();
+    }
+    if (g_tui_active.load()) {
+      print_dump_error_screen(exc.what());
+    }
     leave_dump_tui();
-    std::cerr << "ERROR: " << exc.what() << "\n";
+    if (!should_use_tui()) {
+      std::cerr << "ERROR: " << exc.what() << "\n";
+    }
     return 2;
   }
 }

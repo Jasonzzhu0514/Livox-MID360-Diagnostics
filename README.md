@@ -10,7 +10,7 @@ C++ CLI 是推荐主路径。它直接走 Livox-SDK2 discovery，不要求提前
 
 ### 准备
 
-普通使用优先下载 GitHub Release 里的预编译二进制：
+普通使用优先下载 GitHub Release 里的预编译二进制。Release 附件由 CI 在 Ubuntu 20.04 基线环境中构建，提供 `x86_64` 和 `aarch64`：
 
 - 最新版本：<https://github.com/Jasonzzhu0514/Livox-MID360-Diagnostics/releases/latest>
 
@@ -21,15 +21,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-D
 ./livox_mid360_diagnostics
 ```
 
-如果手动下载 Release 附件，选择当前架构的 `livox_mid360_diagnostics-linux-*`，然后执行：
+如果手动下载 Release 附件，选择当前架构的 `livox_mid360_diagnostics-<version>-linux-*`；无版本号的 `livox_mid360_diagnostics-linux-*` 是给 latest 稳定直链使用的同一份二进制。下载后执行：
 
 ```bash
-mv ./livox_mid360_diagnostics-linux-* ./livox_mid360_diagnostics
-chmod +x ./livox_mid360_diagnostics
-./livox_mid360_diagnostics
+chmod +x ./livox_mid360_diagnostics-linux-*
+./livox_mid360_diagnostics-linux-*
 ```
 
-这个文件就是完整 C++ 诊断入口。后续继续执行 `./livox_mid360_diagnostics` 即可。
+这个文件就是完整 C++ 诊断入口。后续继续执行它即可。
 
 如果已经 clone 了本仓库，也可以运行：
 

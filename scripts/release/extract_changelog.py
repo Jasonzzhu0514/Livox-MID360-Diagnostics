@@ -6,13 +6,6 @@ import re
 from pathlib import Path
 
 
-def display_version(version: str) -> str:
-    parts = version.split(".")
-    if len(parts) == 3 and parts[2] == "0":
-        return ".".join(parts[:2])
-    return version
-
-
 def extract_section(changelog: Path, version: str) -> str:
     text = changelog.read_text(encoding="utf-8")
     heading = re.compile(rf"^##\s+(?:\[{re.escape(version)}\]|{re.escape(version)})(?:\s+-\s+.*)?\s*$", re.MULTILINE)
@@ -37,7 +30,7 @@ def main() -> int:
     args = parser.parse_args()
 
     body = extract_section(Path(args.changelog), args.version)
-    title = f"Livox MID360 Diagnostics v{display_version(args.version)}"
+    title = f"Livox MID360 Diagnostics v{args.version}"
     lines = [f"# {title}", "", body]
 
     if args.previous_tag:

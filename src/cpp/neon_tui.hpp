@@ -389,11 +389,12 @@ inline bool inherited_alt_screen() {
 
 inline std::string enter_alt_screen() {
   const std::string enter = inherited_alt_screen() ? "" : "\033[?1049h";
-  return color_enabled() ? enter + "\033[?25l" + bg() + "\033[2J\033[H" : enter + "\033[?25l\033[2J\033[H";
+  const std::string input_modes = "\033[?1000l\033[?1002l\033[?1003l\033[?1006l";
+  return color_enabled() ? enter + input_modes + "\033[?25l" + bg() + "\033[2J\033[H" : enter + input_modes + "\033[?25l\033[2J\033[H";
 }
 
 inline std::string leave_alt_screen() {
-  return reset() + "\033[?25h\033[?1049l";
+  return reset() + "\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?25h\033[?1049l";
 }
 
 inline std::string clear_screen() {

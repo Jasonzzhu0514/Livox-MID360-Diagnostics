@@ -85,7 +85,14 @@ source scripts/prepare_config.sh
 
 这一步会编译 `external/Livox-SDK2` 和本仓库的单体 C++ 入口 `livox_mid360_diagnostics`，但不会运行 SDK 工具。
 
-如果目标设备不想拉 submodule、也不想编译 SDK，可以在同架构 Linux 设备上生成 C++ 预编译包：
+正式 Release 会由 GitHub Actions 在 Ubuntu 20.04 基线环境中自动生成 `x86_64` 和 `aarch64` 预编译二进制，不需要把 `dist/prebuilt/` 提交进仓库。目标设备优先直接下载最新 Release：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+./livox_mid360_diagnostics
+```
+
+如果目标设备不想拉 submodule、也不想编译 SDK，也可以在同架构 Linux 设备上手动生成 C++ 预编译包：
 
 ```bash
 ./scripts/package_cpp_prebuilt.sh
@@ -94,9 +101,8 @@ source scripts/prepare_config.sh
 生成预编译二进制的机器需要 submodule；目标设备只需要拿到对应架构的 `dist/prebuilt/livox_mid360_diagnostics-linux-*`：
 
 ```bash
-mv ./livox_mid360_diagnostics-linux-* ./livox_mid360_diagnostics
-chmod +x ./livox_mid360_diagnostics
-./livox_mid360_diagnostics
+chmod +x ./livox_mid360_diagnostics-linux-*
+./livox_mid360_diagnostics-linux-*
 ```
 
 远端交互式使用时，先登录再运行：

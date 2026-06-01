@@ -13,11 +13,13 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
 #include <csignal>
@@ -92,6 +94,7 @@ struct DetectionSummary {
 };
 
 std::vector<std::string> detection_rows(const DetectionSummary& summary);
+std::string detection_value(const std::string& value);
 
 struct Theme {
   bool enabled = false;
@@ -112,6 +115,38 @@ Theme g_theme;
 volatile std::sig_atomic_t g_interrupted = 0;
 termios g_original_termios {};
 bool g_has_original_termios = false;
+std::chrono::steady_clock::time_point g_scan_started_at;
+std::string g_scan_stage = "starting";
+std::string g_scan_detail = "preparing";
+
+void throw_if_interrupted();
+void enter_screen();
+void leave_screen();
+void progress(const std::string& message);
+
+enum class InputKey {
+  Unknown,
+  Enter,
+  Quit,
+  Escape,
+  Up,
+  Down,
+  Left,
+  Right,
+  Space,
+  ToggleAll,
+};
+
+void set_noecho_input() {
+  if (!isatty(STDIN_FILENO) || g_has_original_termios || tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
+    return;
+  }
+  termios noecho = g_original_termios;
+  noecho.c_lflag &= static_cast<unsigned>(~ECHO);
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &noecho) == 0) {
+    g_has_original_termios = true;
+  }
+}
 
 std::string home_dir() {
   const char* home = std::getenv("HOME");
@@ -129,6 +164,17 @@ std::string trim(const std::string& value) {
     return "";
   }
   return std::string(begin, end);
+}
+
+std::string join_strings(const std::vector<std::string>& values, const std::string& separator = ", ") {
+  std::ostringstream out;
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i) {
+      out << separator;
+    }
+    out << values[i];
+  }
+  return out.str();
 }
 
 std::string lower_copy(std::string value) {
@@ -323,36 +369,115 @@ bool directory_exists(const std::string& path) {
 }
 
 std::string run_text(const std::vector<std::string>& args, double timeout_sec = 0.0) {
-  std::ostringstream command;
-  if (timeout_sec > 0.0) {
-    command << "timeout " << timeout_sec << " ";
-  }
-  for (size_t i = 0; i < args.size(); ++i) {
-    if (i) {
-      command << " ";
-    }
-    command << "'";
-    for (char ch : args[i]) {
-      if (ch == '\'') {
-        command << "'\\''";
-      } else {
-        command << ch;
-      }
-    }
-    command << "'";
-  }
-  command << " 2>&1";
-
-  FILE* pipe = popen(command.str().c_str(), "r");
-  if (!pipe) {
+  if (args.empty()) {
     return "";
   }
+  int pipe_fds[2] = {-1, -1};
+  if (pipe(pipe_fds) != 0) {
+    return "";
+  }
+
+  std::vector<std::string> command = args;
+
+  pid_t child = fork();
+  if (child < 0) {
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    return "";
+  }
+  if (child == 0) {
+    setpgid(0, 0);
+    dup2(pipe_fds[1], STDOUT_FILENO);
+    dup2(pipe_fds[1], STDERR_FILENO);
+    const int dev_null = open("/dev/null", O_RDONLY);
+    if (dev_null >= 0) {
+      dup2(dev_null, STDIN_FILENO);
+      close(dev_null);
+    }
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
+    std::vector<char*> raw_args;
+    raw_args.reserve(command.size() + 1);
+    for (std::string& arg : command) {
+      raw_args.push_back(arg.data());
+    }
+    raw_args.push_back(nullptr);
+    execvp(raw_args[0], raw_args.data());
+    _exit(127);
+  }
+
+  setpgid(child, child);
+  close(pipe_fds[1]);
+  fcntl(pipe_fds[0], F_SETFL, fcntl(pipe_fds[0], F_GETFL, 0) | O_NONBLOCK);
+
   std::string output;
   std::array<char, 4096> buffer{};
-  while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
-    output += buffer.data();
+  int status = 0;
+  bool child_done = false;
+  bool timed_out = false;
+  const auto deadline = timeout_sec > 0.0
+      ? std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<int>(timeout_sec * 1000.0))
+      : std::chrono::steady_clock::time_point::max();
+  const auto stop_child = [&]() {
+    kill(-child, SIGTERM);
+    for (int i = 0; i < 10; ++i) {
+      const pid_t waited = waitpid(child, &status, WNOHANG);
+      if (waited == child || (waited < 0 && errno == ECHILD)) {
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    kill(-child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+  };
+  while (!child_done) {
+    const ssize_t bytes = read(pipe_fds[0], buffer.data(), buffer.size());
+    if (bytes > 0) {
+      output.append(buffer.data(), static_cast<size_t>(bytes));
+    }
+
+    const pid_t waited = waitpid(child, &status, WNOHANG);
+    if (waited == child) {
+      child_done = true;
+      continue;
+    } else if (waited < 0 && errno == ECHILD) {
+      child_done = true;
+      continue;
+    }
+
+    if (g_interrupted) {
+      stop_child();
+      close(pipe_fds[0]);
+      throw_if_interrupted();
+    }
+
+    if (timeout_sec > 0.0 && std::chrono::steady_clock::now() >= deadline) {
+      timed_out = true;
+      stop_child();
+      child_done = true;
+      continue;
+    }
+
+    if (bytes <= 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
-  pclose(pipe);
+
+  while (true) {
+    const ssize_t bytes = read(pipe_fds[0], buffer.data(), buffer.size());
+    if (bytes <= 0) {
+      break;
+    }
+    output.append(buffer.data(), static_cast<size_t>(bytes));
+  }
+  close(pipe_fds[0]);
+  if (timed_out) {
+    output += "\n[command timed out after " + neon::fixed(timeout_sec, 3) + "s]\n";
+  }
+  throw_if_interrupted();
   return output;
 }
 
@@ -372,35 +497,73 @@ void throw_if_interrupted() {
   }
 }
 
+std::string scan_elapsed_text() {
+  if (g_scan_started_at.time_since_epoch().count() == 0) {
+    return "0.0s";
+  }
+  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_scan_started_at).count();
+  return neon::fixed(std::max(0.0, elapsed), 1) + "s";
+}
+
+void update_scan_stage(const std::string& message) {
+  g_scan_detail = message;
+  const std::string lower = lower_copy(message);
+  if (lower.find("config") != std::string::npos || lower.find("searching") != std::string::npos) {
+    g_scan_stage = "CONFIG SEARCH";
+  } else if (lower.find("interface") != std::string::npos || lower.find("arp") != std::string::npos ||
+             lower.find("neighbor") != std::string::npos || lower.find("active scan") != std::string::npos) {
+    g_scan_stage = "NETWORK CANDIDATES";
+  } else if (lower.find("passive") != std::string::npos || lower.find("listening") != std::string::npos ||
+             lower.find("packet") != std::string::npos) {
+    g_scan_stage = "DISCOVERY LISTEN";
+  } else if (lower.find("found lidar") != std::string::npos) {
+    g_scan_stage = "FOUND";
+  }
+}
+
+void repaint_scan_screen() {
+  if (!g_screen_active) {
+    return;
+  }
+  const neon::Size term = neon::terminal_size();
+  std::ostringstream out;
+  out << neon::clear_screen()
+      << neon::header("LIVOX MID-360 AUTOCONFIG", "SCAN", std::max(40, term.cols));
+  const int panel_w = std::max(40, term.cols);
+  std::vector<std::string> status_rows = {
+      "STATUS       " + neon::badge("STATE", "SCANNING", neon::Color::Warning),
+      "STAGE        " + neon::text(g_scan_stage, neon::Color::Accent, true),
+      "ELAPSED      " + scan_elapsed_text(),
+      "CURRENT      " + g_scan_detail,
+  };
+  int used_rows = 3;
+  neon::append_lines(out, neon::box("SCAN STATUS", status_rows, panel_w), panel_w, term.rows - used_rows - 1, used_rows);
+  const int max_lines = std::max(3, term.rows - used_rows - 5);
+  std::vector<std::string> rows;
+  const size_t begin = g_scan_lines.size() > static_cast<size_t>(max_lines)
+      ? g_scan_lines.size() - static_cast<size_t>(max_lines)
+      : 0;
+  for (size_t i = begin; i < g_scan_lines.size(); ++i) {
+    rows.push_back(g_scan_lines[i]);
+  }
+  if (rows.empty()) {
+    rows.push_back("waiting for discovery output");
+  }
+  neon::append_lines(out, neon::box("DISCOVERY TRACE", rows, panel_w), panel_w, term.rows - used_rows - 1, used_rows);
+  neon::append_footer_at_bottom(out, "[CTRL+C] STOP   no lidar may take a few seconds", term.rows, panel_w, used_rows);
+  std::cout << out.str() << std::flush;
+}
+
 void progress(const std::string& message) {
   throw_if_interrupted();
+  update_scan_stage(message);
   const std::string line = (g_screen_active ? neon::text("扫描", neon::Color::Accent, true) : cyan("扫描")) + " " + message;
   if (g_screen_active) {
     g_scan_lines.push_back(line);
     if (g_scan_lines.size() > 128) {
       g_scan_lines.erase(g_scan_lines.begin());
     }
-    const neon::Size term = neon::terminal_size();
-    std::ostringstream out;
-    out << neon::clear_screen()
-        << neon::header("LIVOX MID-360 AUTOCONFIG", "SCAN", std::max(40, term.cols));
-    const int panel_w = std::max(40, term.cols);
-    const int max_lines = std::max(3, term.rows - 8);
-    std::vector<std::string> rows;
-    const size_t begin = g_scan_lines.size() > static_cast<size_t>(max_lines)
-        ? g_scan_lines.size() - static_cast<size_t>(max_lines)
-        : 0;
-    for (size_t i = begin; i < g_scan_lines.size(); ++i) {
-      rows.push_back(g_scan_lines[i]);
-    }
-    if (rows.empty()) {
-      rows.push_back("waiting for discovery output");
-    }
-    int used_rows = 3;
-    neon::append_lines(out, neon::box("DISCOVERY TRACE", rows, panel_w), panel_w, term.rows - used_rows - 1, used_rows);
-    neon::append_footer_at_bottom(out, "[CTRL+C] STOP", term.rows, panel_w, used_rows);
-    std::cout << out.str();
-    std::cout.flush();
+    repaint_scan_screen();
   } else {
     std::cout << line << std::endl;
   }
@@ -408,6 +571,124 @@ void progress(const std::string& message) {
 
 void render_scan_screen(const std::string& message) {
   progress(message);
+}
+
+bool read_char_timeout(char& out, int timeout_ms) {
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(STDIN_FILENO, &read_set);
+  timeval timeout {};
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
+  return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
+}
+
+InputKey read_input_key() {
+  char ch = 0;
+  if (::read(STDIN_FILENO, &ch, 1) != 1) {
+    return InputKey::Quit;
+  }
+  if (ch == '\n' || ch == '\r') {
+    return InputKey::Enter;
+  }
+  if (ch == 'q' || ch == 'Q') {
+    return InputKey::Quit;
+  }
+  if (ch == ' ') {
+    return InputKey::Space;
+  }
+  if (ch == 'a' || ch == 'A') {
+    return InputKey::ToggleAll;
+  }
+  if (ch != '\033') {
+    return InputKey::Unknown;
+  }
+
+  char left = 0;
+  if (!read_char_timeout(left, 50)) {
+    return InputKey::Escape;
+  }
+  if (left != '[' && left != 'O') {
+    return InputKey::Unknown;
+  }
+  char right = 0;
+  if (!read_char_timeout(right, 50)) {
+    return InputKey::Unknown;
+  }
+  switch (right) {
+    case 'A':
+      return InputKey::Up;
+    case 'B':
+      return InputKey::Down;
+    case 'C':
+      return InputKey::Right;
+    case 'D':
+      return InputKey::Left;
+    default:
+      return InputKey::Unknown;
+  }
+}
+
+void wait_for_exit_key() {
+  if (!isatty(STDIN_FILENO)) {
+    return;
+  }
+  termios original {};
+  if (tcgetattr(STDIN_FILENO, &original) != 0) {
+    return;
+  }
+  termios raw = original;
+  raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+  raw.c_cc[VMIN] = 1;
+  raw.c_cc[VTIME] = 0;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+    return;
+  }
+  while (true) {
+    const InputKey key = read_input_key();
+    if (key == InputKey::Enter || key == InputKey::Quit || key == InputKey::Escape) {
+      break;
+    }
+  }
+  tcsetattr(STDIN_FILENO, TCSANOW, &original);
+}
+
+void show_not_found_screen(const DetectionSummary& summary) {
+  if (!g_screen_active) {
+    return;
+  }
+  const neon::Size term = neon::terminal_size();
+  const int width = std::max(40, term.cols);
+  int used_rows = 3;
+  std::ostringstream out;
+  out << neon::clear_screen()
+      << neon::header("LIVOX MID-360 AUTOCONFIG", "NOT FOUND", width);
+  std::vector<std::string> status_rows = {
+      "STATUS       " + neon::badge("STATE", "NOT FOUND", neon::Color::Danger),
+      "ELAPSED      " + scan_elapsed_text(),
+      "IFACE        " + detection_value(summary.iface),
+      "IFACE_IP     " + detection_value(summary.result.iface_ip),
+      "LIDAR_IP     " + neon::text("N/A", neon::Color::Danger, true),
+      "",
+      "No MID360 was found by ARP/neigh candidates or passive discovery.",
+      "Check power, Ethernet link, host IP/subnet, and firewall/tcpdump permission.",
+      "For a normal validation run, choose monitor after the lidar is connected.",
+  };
+  neon::append_lines(out, neon::box("SCAN RESULT", status_rows, width), width, term.rows - used_rows - 1, used_rows);
+
+  const int max_lines = std::max(3, term.rows - used_rows - 5);
+  std::vector<std::string> rows;
+  const size_t begin = g_scan_lines.size() > static_cast<size_t>(max_lines)
+      ? g_scan_lines.size() - static_cast<size_t>(max_lines)
+      : 0;
+  for (size_t i = begin; i < g_scan_lines.size(); ++i) {
+    rows.push_back(g_scan_lines[i]);
+  }
+  neon::append_lines(out, neon::box("LAST TRACE", rows, width), width, term.rows - used_rows - 1, used_rows);
+  neon::append_footer_at_bottom(out, "[ENTER/Q/ESC] EXIT", term.rows, width, used_rows);
+  std::cout << out.str() << std::flush;
+  wait_for_exit_key();
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -736,44 +1017,78 @@ std::vector<std::string> discover_config_paths(const Options& options) {
     }
     return a < b;
   });
+  if (found.empty()) {
+    progress("config search found no MID360_config.json candidates");
+  } else {
+    progress("config search found " + std::to_string(found.size()) + " candidate(s)");
+    const size_t visible_count = options.verbose ? found.size() : std::min<size_t>(found.size(), 8);
+    for (size_t i = 0; i < visible_count; ++i) {
+      progress("config[" + std::to_string(i + 1) + "] " + compact_path(found[i], 96));
+    }
+    if (!options.verbose && found.size() > visible_count) {
+      progress("config list truncated; pass --verbose to show all " + std::to_string(found.size()) + " candidate(s)");
+    }
+  }
   debug(options, "discovered configs=" + std::to_string(found.size()));
   return found;
 }
 
 std::vector<std::string> resolve_config_paths(const Options& options) {
   if (!options.configs.empty()) {
+    progress("using explicit config path(s): " + join_strings(options.configs));
     return options.configs;
   }
   std::vector<std::string> discovered = discover_config_paths(options);
   if (!discovered.empty()) {
+    progress("using discovered config path(s)");
     return discovered;
   }
   std::vector<std::string> configured = env_paths({"LIVOX_MID360_CONFIG", "MID360_CONFIG"});
   if (!configured.empty()) {
+    progress("using config path(s) from environment: " + join_strings(configured));
     return configured;
   }
   const std::string local_config = "config/MID360_config.local.json";
   if (regular_file_exists(local_config)) {
+    progress("using local config: " + local_config);
     return {local_config};
   }
+  progress("no config file selected yet; discovery will still run");
   return {"MID360_config.json"};
 }
 
 std::vector<std::string> candidate_ifaces(const Options& options, const std::vector<std::string>& config_paths) {
   if (options.iface != "auto") {
+    progress("using explicit interface: " + options.iface);
     return {options.iface};
   }
   const auto interfaces = list_ipv4_interfaces();
+  if (interfaces.empty()) {
+    progress("no non-loopback IPv4 interface found; falling back to eth0");
+  } else {
+    std::vector<std::string> descriptions;
+    for (const auto& iface : interfaces) {
+      descriptions.push_back(iface.name + "=" + iface.ip + "/" + std::to_string(iface.prefix));
+    }
+    progress("available IPv4 interfaces: " + join_strings(descriptions));
+  }
   std::vector<std::string> candidates;
   for (const auto& path : config_paths) {
     const std::string lidar_ip = read_config_lidar_ip(path);
     if (lidar_ip.empty()) {
+      if (options.verbose) {
+        progress("config has no lidar IP: " + compact_path(path, 96));
+      }
       continue;
+    }
+    if (options.verbose) {
+      progress("config lidar IP " + lidar_ip + " from " + compact_path(path, 96));
     }
     for (const auto& iface : interfaces) {
       if (ip_in_network(lidar_ip, iface.ip, iface.prefix) &&
           std::find(candidates.begin(), candidates.end(), iface.name) == candidates.end()) {
         candidates.push_back(iface.name);
+        progress("interface " + iface.name + " matches configured lidar network");
       }
     }
   }
@@ -791,6 +1106,7 @@ std::vector<std::string> candidate_ifaces(const Options& options, const std::vec
   if (candidates.empty()) {
     candidates.push_back("eth0");
   }
+  progress("interface scan order: " + join_strings(candidates));
   return candidates;
 }
 
@@ -888,45 +1204,28 @@ Discovery active_scan(const std::string& iface, const Options& options) {
   Discovery result;
   result.iface_ip = iface_ipv4(iface);
   result.method = "active_scan";
-  const auto hosts = host_ips_for_iface(iface);
-  if (hosts.empty()) {
-    debug(options, "active scan skipped: no IPv4 network for " + iface);
-    return result;
-  }
-  progress("active scan on " + iface + " hosts=" + std::to_string(hosts.size()));
-
-  std::vector<std::thread> workers;
-  size_t cursor = 0;
-  const size_t worker_count = std::min<size_t>(64, hosts.size());
-  std::mutex cursor_mutex;
-  for (size_t i = 0; i < worker_count; ++i) {
-    workers.emplace_back([&]() {
-      while (true) {
-        std::string ip;
-        {
-          std::lock_guard<std::mutex> lock(cursor_mutex);
-          if (cursor >= hosts.size()) {
-            return;
-          }
-          ip = hosts[cursor++];
-        }
-        run_text({"ping", "-I", iface, "-c", "1", "-W", "1", ip}, 1.2);
-      }
-    });
-  }
-  for (auto& worker : workers) {
-    worker.join();
-  }
+  progress("checking existing ARP/neigh entries on " + iface);
 
   const auto gateways = gateway_ips(iface);
+  if (gateways.empty()) {
+    progress("gateway filter: none");
+  } else {
+    progress("gateway filter: " + join_strings(gateways));
+  }
   auto entries = neighbor_entries(iface);
+  progress("neighbor table entries: " + std::to_string(entries.size()));
   for (auto& entry : entries) {
     if (entry.ip == result.iface_ip ||
         std::find(gateways.begin(), gateways.end(), entry.ip) != gateways.end()) {
       entry.score = -1;
       continue;
     }
-    entry.ttl = ping_ttl(iface, entry.ip);
+    const bool livox_mac = std::any_of(kLivoxMacPrefixes.begin(), kLivoxMacPrefixes.end(), [&](const char* prefix) {
+      return entry.mac.rfind(prefix, 0) == 0;
+    });
+    if (livox_mac || entry.ip.rfind("192.168.1.", 0) == 0) {
+      entry.ttl = ping_ttl(iface, entry.ip);
+    }
     for (const char* prefix : kLivoxMacPrefixes) {
       if (entry.mac.rfind(prefix, 0) == 0) {
         entry.score += 100;
@@ -951,19 +1250,22 @@ Discovery active_scan(const std::string& iface, const Options& options) {
 
   if (!entries.empty()) {
     std::ostringstream preview;
-    for (size_t i = 0; i < std::min<size_t>(entries.size(), 5); ++i) {
+    for (size_t i = 0; i < std::min<size_t>(entries.size(), 8); ++i) {
       if (i) {
         preview << ", ";
       }
       preview << entries[i].ip << " ttl=" << (entries[i].ttl >= 0 ? std::to_string(entries[i].ttl) : "N/A")
-              << " mac=" << entries[i].mac << " score=" << entries[i].score;
+              << " mac=" << entries[i].mac << " state=" << entries[i].state << " score=" << entries[i].score;
     }
     progress("active scan candidates: " + preview.str());
   }
   if (!entries.empty() && entries.front().score >= kMinActiveScanScore) {
     result.lidar_ip = entries.front().ip;
+    progress("active scan selected " + result.lidar_ip + " score=" + std::to_string(entries.front().score));
   } else if (!entries.empty()) {
     progress("active scan found online devices, but none match known MID360/Livox signatures");
+  } else {
+    progress("active scan found no usable neighbor entries");
   }
   return result;
 }
@@ -972,38 +1274,98 @@ Discovery sniff(const std::string& iface, double timeout_sec, const Options& opt
   Discovery result;
   result.iface_ip = iface_ipv4(iface);
 
-  std::string tcpdump = "/usr/sbin/tcpdump";
-  if (!file_exists(tcpdump)) {
-    tcpdump = "tcpdump";
-  }
-  std::vector<std::string> command;
-  if (!options.no_sudo && geteuid() != 0) {
-    command.push_back("sudo");
-  }
-  command.push_back(tcpdump);
-  command.push_back("-lni");
-  command.push_back(iface);
-  command.push_back("(udp and port 56000) or arp");
-
   progress("listening on " + iface + " for Livox discovery packets (" + std::to_string(timeout_sec) + "s)");
-  const std::string output = run_text(command, timeout_sec);
-  std::regex udp_regex(R"(\bIP\s+(\d+\.\d+\.\d+\.\d+)\.56000\s+>)");
-  std::regex arp_regex(R"(who-has\s+(\d+\.\d+\.\d+\.\d+)\s+tell\s+(\d+\.\d+\.\d+\.\d+))");
-  for (const auto& line : split_lines(output)) {
-    std::smatch match;
-    if (std::regex_search(line, match, udp_regex)) {
-      const std::string source_ip = match[1].str();
-      if (source_ip != result.iface_ip) {
-        result.lidar_ip = source_ip;
-        result.method = "livox_discovery";
-        result.raw_packets += 1;
+
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    progress("passive discovery warning: failed to open UDP socket");
+    return result;
+  }
+
+  int reuse = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+#ifdef SO_BINDTODEVICE
+  if (!iface.empty()) {
+    setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.size() + 1);
+  }
+#endif
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+  sockaddr_in bind_addr {};
+  bind_addr.sin_family = AF_INET;
+  bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  bind_addr.sin_port = htons(kDiscoveryPort);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+    progress("passive discovery warning: failed to bind UDP port " + std::to_string(kDiscoveryPort) + " (" + std::strerror(errno) + ")");
+    close(fd);
+    return result;
+  }
+
+  size_t parsed_packets = 0;
+  const auto deadline = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(static_cast<int>(std::max(0.1, timeout_sec) * 1000.0));
+  auto next_repaint = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  while (std::chrono::steady_clock::now() < deadline) {
+    throw_if_interrupted();
+    const auto loop_now = std::chrono::steady_clock::now();
+    if (loop_now >= next_repaint) {
+      repaint_scan_screen();
+      next_repaint = loop_now + std::chrono::milliseconds(250);
+    }
+    fd_set read_set;
+    FD_ZERO(&read_set);
+    FD_SET(fd, &read_set);
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining_ms = std::max<long long>(
+        1,
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    const auto repaint_ms = std::max<long long>(
+        1,
+        std::chrono::duration_cast<std::chrono::milliseconds>(next_repaint - now).count());
+    const long long wait_ms = std::min(remaining_ms, repaint_ms);
+    timeval wait {};
+    wait.tv_sec = static_cast<long>(wait_ms / 1000);
+    wait.tv_usec = static_cast<long>((wait_ms % 1000) * 1000);
+    const int ready = select(fd + 1, &read_set, nullptr, nullptr, &wait);
+    if (ready < 0) {
+      if (errno == EINTR) {
+        continue;
       }
+      break;
     }
-    if (line.find("ARP,") != std::string::npos && std::regex_search(line, match, arp_regex)) {
-      result.requested_host_ip = match[1].str();
-      result.lidar_ip = match[2].str();
-      result.method = "arp_observed";
+    if (ready == 0) {
+      continue;
     }
+
+    std::array<unsigned char, 2048> buffer {};
+    sockaddr_in peer {};
+    socklen_t peer_len = sizeof(peer);
+    const ssize_t bytes = recvfrom(fd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    if (bytes <= 0) {
+      continue;
+    }
+    ++parsed_packets;
+    char source[INET_ADDRSTRLEN] {};
+    inet_ntop(AF_INET, &peer.sin_addr, source, sizeof(source));
+    const std::string source_ip = source;
+    if (!source_ip.empty() && source_ip != result.iface_ip) {
+      result.lidar_ip = source_ip;
+      result.method = "livox_discovery_udp";
+      result.raw_packets += 1;
+      progress("passive discovery UDP packet from " + source_ip + " bytes=" + std::to_string(bytes));
+      break;
+    }
+  }
+  close(fd);
+
+  if (result.lidar_ip.empty()) {
+    progress("passive discovery timeout reached after " + neon::fixed(timeout_sec, 1) + "s");
+    progress("passive discovery finished: no lidar packets, udp packets=" + std::to_string(parsed_packets));
+  } else {
+    progress("passive discovery finished: lidar=" + result.lidar_ip + " method=" + result.method);
   }
   return result;
 }
@@ -1027,6 +1389,7 @@ std::pair<std::string, Discovery> discover(const std::vector<std::string>& iface
       progress("found lidar by active scan on " + iface + ": " + result.lidar_ip);
       return {iface, result};
     }
+    progress("active scan on " + iface + " did not identify MID360");
     last = result;
   }
   const double per_iface_timeout = ifaces.size() == 1 ? options.timeout_sec : std::max(1.5, std::min(options.timeout_sec, 2.0));
@@ -1037,6 +1400,7 @@ std::pair<std::string, Discovery> discover(const std::vector<std::string>& iface
       progress("found lidar by passive discovery on " + iface + ": " + result.lidar_ip);
       return {iface, result};
     }
+    progress("passive discovery on " + iface + " did not identify MID360");
     last = result;
   }
   return {ifaces.empty() ? "eth0" : ifaces.back(), last};
@@ -1387,15 +1751,7 @@ void enter_screen() {
   if (!isatty(STDOUT_FILENO)) {
     return;
   }
-  if (isatty(STDIN_FILENO) && !g_has_original_termios && tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
-    termios raw = g_original_termios;
-    raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
-      g_has_original_termios = true;
-    }
-  }
+  set_noecho_input();
   std::cout << neon::enter_alt_screen() << std::flush;
   g_screen_active = true;
 }
@@ -1459,6 +1815,8 @@ std::vector<size_t> choose_configs_interactively(
     print_config_table(states, initial_show_all);
     return {};
   }
+  g_has_original_termios = true;
+  g_original_termios = original;
 
   size_t cursor = 0;
   bool show_all = initial_show_all;
@@ -1477,53 +1835,29 @@ std::vector<size_t> choose_configs_interactively(
     std::cout << render_config_picker(states, summary, show_all, cursor, checked);
     std::cout.flush();
   };
-  auto read_char_timeout = [](char& out, int timeout_ms) {
-    fd_set read_set;
-    FD_ZERO(&read_set);
-    FD_SET(STDIN_FILENO, &read_set);
-    timeval timeout {};
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
-    return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
-  };
-
   redraw();
   while (!done) {
-    char ch = 0;
-    if (::read(STDIN_FILENO, &ch, 1) != 1) {
-      cancelled = true;
-      break;
-    }
-    if (ch == '\033') {
-      char left = 0;
-      char right = 0;
-      if (read_char_timeout(left, 50) && read_char_timeout(right, 50) && left == '[') {
-        if (right == 'A') {
-          if (!visible_states.empty()) {
-            cursor = cursor == 0 ? visible_states.size() - 1 : cursor - 1;
-          }
-        } else if (right == 'B') {
-          if (!visible_states.empty()) {
-            cursor = (cursor + 1) % visible_states.size();
-          }
-        }
-      } else {
-        cancelled = true;
-        done = true;
+    const InputKey key = read_input_key();
+    if (key == InputKey::Up) {
+      if (!visible_states.empty()) {
+        cursor = cursor == 0 ? visible_states.size() - 1 : cursor - 1;
       }
-    } else if (ch == ' ') {
+    } else if (key == InputKey::Down) {
+      if (!visible_states.empty()) {
+        cursor = (cursor + 1) % visible_states.size();
+      }
+    } else if (key == InputKey::Space) {
       if (!visible_states.empty()) {
         const size_t original_index = visible_states[cursor].original_index;
         if (original_index < checked.size()) {
           checked[original_index] = !checked[original_index];
         }
       }
-    } else if (ch == '\n' || ch == '\r') {
+    } else if (key == InputKey::Enter) {
       done = true;
-    } else if (ch == 'a' || ch == 'A') {
+    } else if (key == InputKey::ToggleAll) {
       show_all = !show_all;
-    } else if (ch == 'q' || ch == 'Q') {
+    } else if (key == InputKey::Quit || key == InputKey::Escape) {
       cancelled = true;
       done = true;
     }
@@ -1612,6 +1946,7 @@ Options parse_args(int argc, char** argv) {
 
 int main(int argc, char** argv) {
   try {
+    std::atexit(leave_screen);
     std::signal(SIGINT, handle_interrupt);
     const Options options = parse_args(argc, argv);
     init_theme(options.no_color);
@@ -1619,6 +1954,8 @@ int main(int argc, char** argv) {
     const bool interactive_picker = !options.apply && isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
     if (interactive_picker) {
       enter_screen();
+      g_scan_started_at = std::chrono::steady_clock::now();
+      g_scan_stage = "CONFIG SEARCH";
       render_scan_screen("preparing config search");
     }
     const auto config_paths = resolve_config_paths(options);
@@ -1634,8 +1971,13 @@ int main(int argc, char** argv) {
     }
 
     if (result.lidar_ip.empty()) {
+      if (interactive_picker) {
+        show_not_found_screen(summary);
+      }
       leave_screen();
-      std::cerr << "ERROR: no MID360 lidar IP found by passive discovery or active scan\n";
+      if (!interactive_picker) {
+        std::cerr << "ERROR: no MID360 lidar IP found by passive discovery or active scan\n";
+      }
       return 2;
     }
 

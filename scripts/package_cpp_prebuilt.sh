@@ -10,13 +10,17 @@ package_name="livox-mid360-diagnostics-cpp-${version}-linux-${arch}"
 prebuilt_dir="$repo_root/dist/prebuilt"
 package_path="$prebuilt_dir/$package_name.tar.gz"
 launcher_path="$prebuilt_dir/livox_mid360_diagnostics-linux-${arch}"
+versioned_launcher_path="$prebuilt_dir/livox_mid360_diagnostics-${version}-linux-${arch}"
 
 ./scripts/build_cpp_with_sdk2.sh
 
 mkdir -p "$prebuilt_dir"
 cp build/sdk2/livox_mid360_diagnostics "$launcher_path"
 chmod +x "$launcher_path"
+cp "$launcher_path" "$versioned_launcher_path"
+chmod +x "$versioned_launcher_path"
 
 tar -C "$prebuilt_dir" -czf "$package_path" "$(basename "$launcher_path")"
 echo "created: $launcher_path"
+echo "created: $versioned_launcher_path"
 echo "created: $package_path"

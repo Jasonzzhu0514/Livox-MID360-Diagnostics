@@ -9,9 +9,83 @@ permissions:
   contents: write
 
 jobs:
+  build-prebuilt:
+    name: 构建 ${{ matrix.arch }} 预编译二进制
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04
+    steps:
+      - name: 安装构建依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            cmake \
+            g++ \
+            gcc \
+            git \
+            libncursesw5-dev \
+            make \
+            pkg-config \
+            python3 \
+            python3-pip \
+            tar
+
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 构建单体程序
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/package_cpp_prebuilt.sh
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          ARCH="${{ matrix.arch }}"
+          BINARY="dist/prebuilt/livox_mid360_diagnostics-linux-${ARCH}"
+          VERSIONED_BINARY="dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-${ARCH}"
+          PACKAGE="dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-${ARCH}.tar.gz"
+
+          test -x "${BINARY}"
+          test -x "${VERSIONED_BINARY}"
+          test -s "${PACKAGE}"
+          tar -tzf "${PACKAGE}" | grep -Fx "livox_mid360_diagnostics-linux-${ARCH}"
+          "${BINARY}" --version
+          "${VERSIONED_BINARY}" --version
+          "${BINARY}" --help
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuilt-${{ matrix.arch }}
+          path: |
+            dist/prebuilt/livox_mid360_diagnostics-linux-${{ matrix.arch }}
+            dist/prebuilt/livox_mid360_diagnostics-*-linux-${{ matrix.arch }}
+            dist/prebuilt/livox-mid360-diagnostics-cpp-*-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
   publish-release:
     name: 从版本标签发布 Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    needs: build-prebuilt
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -28,20 +102,20 @@ jobs:
 
           python3 scripts/release/validate_release.py --tag "${TAG}" --require-tag-at-head
 
-          IFS=. read -r MAJOR MINOR PATCH <<< "${VERSION}"
-          if [[ -z "${MAJOR}" || -z "${MINOR}" || -z "${PATCH}" ]]; then
+          IFS=. read -r MAJOR MINOR PATCH EXTRA <<< "${VERSION}"
+          if [[ -z "${MAJOR}" || -z "${MINOR}" || -z "${PATCH}" || -n "${EXTRA:-}" ]]; then
             echo "VERSION must use <major>.<minor>.<patch>: ${VERSION}" >&2
             exit 1
-          fi
-          if [[ "${PATCH}" == "0" ]]; then
-            DISPLAY_VERSION="${MAJOR}.${MINOR}"
-          else
-            DISPLAY_VERSION="${VERSION}"
           fi
 
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
-          echo "display_version=${DISPLAY_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: 下载预编译产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/prebuilt
+          merge-multiple: true
 
       - name: 校验预编译附件
         shell: bash
@@ -49,6 +123,10 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.version.outputs.version }}"
           REQUIRED=(
+            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
+            "dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-aarch64"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
           )
@@ -99,19 +177,16 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.version.outputs.tag }}"
-          TITLE="Livox MID360 Diagnostics v${{ steps.version.outputs.display_version }}"
+          TITLE="Livox MID360 Diagnostics v${{ steps.version.outputs.version }}"
           VERSION="${{ steps.version.outputs.version }}"
           ASSETS=(
+            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"
+            "dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-x86_64"
+            "dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-aarch64"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
           )
-          for optional_asset in \
-            "dist/prebuilt/livox_mid360_diagnostics-linux-x86_64" \
-            "dist/prebuilt/livox_mid360_diagnostics-linux-aarch64"; do
-            if [[ -s "${optional_asset}" ]]; then
-              ASSETS+=("${optional_asset}")
-            fi
-          done
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release already exists for ${TAG}" >&2
