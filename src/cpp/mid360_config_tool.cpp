@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -44,6 +45,7 @@ namespace {
 
 constexpr int kDiscoveryPort = 56000;
 constexpr int kMinActiveScanScore = 100;
+constexpr int kReturnToMenuCode = 75;
 const std::array<const char*, 1> kLivoxMacPrefixes = {"8c:58:23"};
 
 struct Options {
@@ -111,6 +113,8 @@ struct Theme {
 const std::array<const char*, 2> kMid360ConfigKeys = {"MID360", "Mid360s"};
 bool g_screen_active = false;
 std::vector<std::string> g_scan_lines;
+neon::FrameClock g_scan_frame_clock(std::chrono::milliseconds(100));
+neon::LineDiffRenderer g_scan_renderer;
 Theme g_theme;
 volatile std::sig_atomic_t g_interrupted = 0;
 termios g_original_termios {};
@@ -123,26 +127,18 @@ void throw_if_interrupted();
 void enter_screen();
 void leave_screen();
 void progress(const std::string& message);
+void refresh_scan_screen(bool heartbeat = false);
 
-enum class InputKey {
-  Unknown,
-  Enter,
-  Quit,
-  Escape,
-  Up,
-  Down,
-  Left,
-  Right,
-  Space,
-  ToggleAll,
-};
+using InputKey = neon::Key;
 
 void set_noecho_input() {
   if (!isatty(STDIN_FILENO) || g_has_original_termios || tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
     return;
   }
   termios noecho = g_original_termios;
-  noecho.c_lflag &= static_cast<unsigned>(~ECHO);
+  noecho.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+  noecho.c_cc[VMIN] = 1;
+  noecho.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSANOW, &noecho) == 0) {
     g_has_original_termios = true;
   }
@@ -299,6 +295,95 @@ std::string compact_path(const std::string& path, size_t max_width = 76) {
   return ".../" + display.substr(display.size() - tail_width);
 }
 
+std::string path_filename(const std::string& path) {
+  const std::string display = path_display(path);
+  const size_t slash = display.find_last_of('/');
+  return slash == std::string::npos ? display : display.substr(slash + 1);
+}
+
+std::string path_parent_display(const std::string& path) {
+  const std::string display = path_display(path);
+  const size_t slash = display.find_last_of('/');
+  if (slash == std::string::npos) {
+    return ".";
+  }
+  if (slash == 0) {
+    return "/";
+  }
+  return display.substr(0, slash);
+}
+
+std::vector<std::string> split_path_segments(const std::string& value) {
+  std::vector<std::string> segments;
+  std::string item;
+  std::istringstream stream(value);
+  while (std::getline(stream, item, '/')) {
+    if (!item.empty()) {
+      segments.push_back(item);
+    }
+  }
+  return segments;
+}
+
+std::string compact_parent_path(const std::string& path, size_t max_width) {
+  const std::string parent = path_parent_display(path);
+  if (parent.size() <= max_width) {
+    return parent;
+  }
+  const std::vector<std::string> segments = split_path_segments(parent);
+  if (segments.size() < 3) {
+    return compact_path(parent, max_width);
+  }
+  size_t root_index = 0;
+  if (segments[root_index] == "~" && root_index + 1 < segments.size()) {
+    ++root_index;
+  }
+  if (segments[root_index] == "Documents" && root_index + 1 < segments.size()) {
+    ++root_index;
+  }
+  const std::string root = segments[root_index];
+  if (max_width <= 10) {
+    return neon::fit(root, static_cast<int>(max_width));
+  }
+  const size_t max_tail = std::min<size_t>(3, segments.size() - root_index - 1);
+  for (size_t tail_count = max_tail; tail_count > 0; --tail_count) {
+    std::vector<std::string> tail(
+        segments.end() - static_cast<std::ptrdiff_t>(tail_count),
+        segments.end());
+    const std::string suffix = "/.../" + join_strings(tail, "/");
+    if (suffix.size() + 4 >= max_width) {
+      continue;
+    }
+    const std::string candidate = neon::fit(root, static_cast<int>(max_width - suffix.size())) + suffix;
+    if (candidate.size() <= max_width) {
+      return candidate;
+    }
+  }
+  const std::string suffix = "/.../" + segments.back();
+  if (suffix.size() + 4 < max_width) {
+    return neon::fit(root, static_cast<int>(max_width - suffix.size())) + suffix;
+  }
+  return compact_path(parent, max_width);
+}
+
+std::vector<std::string> wrap_path_for_display(const std::string& path, size_t width, size_t max_lines = 3) {
+  std::vector<std::string> lines;
+  std::string rest = path_display(path);
+  width = std::max<size_t>(8, width);
+  while (rest.size() > width && lines.size() + 1 < max_lines) {
+    size_t cut = rest.rfind('/', width);
+    if (cut == std::string::npos || cut < width / 3) {
+      cut = width;
+    } else {
+      cut += 1;
+    }
+    lines.push_back(rest.substr(0, cut));
+    rest.erase(0, cut);
+  }
+  lines.push_back(rest);
+  return lines;
+}
+
 bool is_low_priority_config_path(const std::string& path) {
   const std::string lower = lower_copy(path_display(path));
   return lower.find("/external/") != std::string::npos ||
@@ -368,7 +453,10 @@ bool directory_exists(const std::string& path) {
   return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
-std::string run_text(const std::vector<std::string>& args, double timeout_sec = 0.0) {
+std::string run_text(
+    const std::vector<std::string>& args,
+    double timeout_sec = 0.0,
+    const std::function<void()>& on_wait = {}) {
   if (args.empty()) {
     return "";
   }
@@ -454,6 +542,16 @@ std::string run_text(const std::vector<std::string>& args, double timeout_sec = 
       throw_if_interrupted();
     }
 
+    if (on_wait) {
+      on_wait();
+    }
+
+    if (g_interrupted) {
+      stop_child();
+      close(pipe_fds[0]);
+      throw_if_interrupted();
+    }
+
     if (timeout_sec > 0.0 && std::chrono::steady_clock::now() >= deadline) {
       timed_out = true;
       stop_child();
@@ -527,8 +625,7 @@ void repaint_scan_screen() {
   }
   const neon::Size term = neon::terminal_size();
   std::ostringstream out;
-  out << neon::clear_screen()
-      << neon::header("LIVOX MID-360 AUTOCONFIG", "SCAN", std::max(40, term.cols));
+  out << neon::header("LIVOX MID-360 AUTOCONFIG", "SCAN", std::max(40, term.cols));
   const int panel_w = std::max(40, term.cols);
   std::vector<std::string> status_rows = {
       "STATUS       " + neon::badge("STATE", "SCANNING", neon::Color::Warning),
@@ -551,7 +648,16 @@ void repaint_scan_screen() {
   }
   neon::append_lines(out, neon::box("DISCOVERY TRACE", rows, panel_w), panel_w, term.rows - used_rows - 1, used_rows);
   neon::append_footer_at_bottom(out, "[CTRL+C] STOP   no lidar may take a few seconds", term.rows, panel_w, used_rows);
-  std::cout << out.str() << std::flush;
+  g_scan_renderer.render(out.str(), term.rows, panel_w);
+}
+
+void refresh_scan_screen(bool heartbeat) {
+  if (!g_screen_active) {
+    return;
+  }
+  if (g_scan_frame_clock.consume_redraw(heartbeat)) {
+    repaint_scan_screen();
+  }
 }
 
 void progress(const std::string& message) {
@@ -563,7 +669,8 @@ void progress(const std::string& message) {
     if (g_scan_lines.size() > 128) {
       g_scan_lines.erase(g_scan_lines.begin());
     }
-    repaint_scan_screen();
+    g_scan_frame_clock.request_redraw();
+    refresh_scan_screen(false);
   } else {
     std::cout << line << std::endl;
   }
@@ -573,90 +680,56 @@ void render_scan_screen(const std::string& message) {
   progress(message);
 }
 
-bool read_char_timeout(char& out, int timeout_ms) {
-  fd_set read_set;
-  FD_ZERO(&read_set);
-  FD_SET(STDIN_FILENO, &read_set);
-  timeval timeout {};
-  timeout.tv_sec = timeout_ms / 1000;
-  timeout.tv_usec = (timeout_ms % 1000) * 1000;
-  const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout);
-  return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
+void scan_wait_tick() {
+  if (g_screen_active) {
+    const InputKey key = neon::read_key(0, 20);
+    if (key == InputKey::Quit || key == InputKey::Escape) {
+      g_interrupted = 1;
+    }
+  }
+  refresh_scan_screen(true);
 }
 
 InputKey read_input_key() {
-  char ch = 0;
-  if (::read(STDIN_FILENO, &ch, 1) != 1) {
-    return InputKey::Quit;
-  }
-  if (ch == '\n' || ch == '\r') {
-    return InputKey::Enter;
-  }
-  if (ch == 'q' || ch == 'Q') {
-    return InputKey::Quit;
-  }
-  if (ch == ' ') {
-    return InputKey::Space;
-  }
-  if (ch == 'a' || ch == 'A') {
-    return InputKey::ToggleAll;
-  }
-  if (ch != '\033') {
-    return InputKey::Unknown;
-  }
-
-  char left = 0;
-  if (!read_char_timeout(left, 50)) {
-    return InputKey::Escape;
-  }
-  if (left != '[' && left != 'O') {
-    return InputKey::Unknown;
-  }
-  char right = 0;
-  if (!read_char_timeout(right, 50)) {
-    return InputKey::Unknown;
-  }
-  switch (right) {
-    case 'A':
-      return InputKey::Up;
-    case 'B':
-      return InputKey::Down;
-    case 'C':
-      return InputKey::Right;
-    case 'D':
-      return InputKey::Left;
-    default:
-      return InputKey::Unknown;
-  }
+  return neon::read_key(-1, 20);
 }
 
-void wait_for_exit_key() {
+bool menu_return_enabled() {
+  const char* value = std::getenv("LIVOX_MID360_ALLOW_MENU_RETURN");
+  return value && std::strcmp(value, "1") == 0;
+}
+
+InputKey wait_for_exit_key(bool allow_menu_return = false) {
   if (!isatty(STDIN_FILENO)) {
-    return;
+    return InputKey::Quit;
   }
   termios original {};
   if (tcgetattr(STDIN_FILENO, &original) != 0) {
-    return;
+    return InputKey::Quit;
   }
   termios raw = original;
   raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
   raw.c_cc[VMIN] = 1;
   raw.c_cc[VTIME] = 0;
   if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
-    return;
+    return InputKey::Quit;
   }
+  InputKey selected = InputKey::Quit;
   while (true) {
     const InputKey key = read_input_key();
-    if (key == InputKey::Enter || key == InputKey::Quit || key == InputKey::Escape) {
+    if (key == InputKey::Enter || key == InputKey::Quit || key == InputKey::Escape ||
+        (allow_menu_return && key == InputKey::Menu)) {
+      selected = key;
       break;
     }
   }
   tcsetattr(STDIN_FILENO, TCSANOW, &original);
+  return selected;
 }
 
-void show_not_found_screen(const DetectionSummary& summary) {
+bool show_not_found_screen(const DetectionSummary& summary) {
   if (!g_screen_active) {
-    return;
+    return false;
   }
   const neon::Size term = neon::terminal_size();
   const int width = std::max(40, term.cols);
@@ -686,9 +759,15 @@ void show_not_found_screen(const DetectionSummary& summary) {
     rows.push_back(g_scan_lines[i]);
   }
   neon::append_lines(out, neon::box("LAST TRACE", rows, width), width, term.rows - used_rows - 1, used_rows);
-  neon::append_footer_at_bottom(out, "[ENTER/Q/ESC] EXIT", term.rows, width, used_rows);
+  const bool allow_menu_return = menu_return_enabled();
+  neon::append_footer_at_bottom(
+      out,
+      allow_menu_return ? "[M] MENU   [ENTER/Q/ESC] EXIT" : "[ENTER/Q/ESC] EXIT",
+      term.rows,
+      width,
+      used_rows);
   std::cout << out.str() << std::flush;
-  wait_for_exit_key();
+  return wait_for_exit_key(allow_menu_return) == InputKey::Menu;
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -983,7 +1062,8 @@ std::vector<std::string> discover_config_paths(const Options& options) {
             "-path",
             "*/build/*",
         },
-        12.0);
+        12.0,
+        scan_wait_tick);
     for (const auto& line : split_lines(output)) {
       if (!line.empty() && is_mid360_config_file(line)) {
         const std::string key = real_path_or_self(line);
@@ -1149,7 +1229,7 @@ std::vector<std::string> host_ips_for_iface(const std::string& iface) {
 
 std::vector<std::string> gateway_ips(const std::string& iface) {
   std::vector<std::string> gateways;
-  const std::string output = run_text({"ip", "route", "show", "dev", iface}, 2.0);
+  const std::string output = run_text({"ip", "route", "show", "dev", iface}, 2.0, scan_wait_tick);
   std::regex pattern(R"(\bvia\s+(\d+\.\d+\.\d+\.\d+))");
   for (auto it = std::sregex_iterator(output.begin(), output.end(), pattern); it != std::sregex_iterator(); ++it) {
     gateways.push_back((*it)[1].str());
@@ -1166,7 +1246,7 @@ struct Neighbor {
 };
 
 std::vector<Neighbor> neighbor_entries(const std::string& iface) {
-  const std::string output = run_text({"ip", "neigh", "show", "dev", iface}, 2.0);
+  const std::string output = run_text({"ip", "neigh", "show", "dev", iface}, 2.0, scan_wait_tick);
   std::vector<Neighbor> entries;
   for (const auto& line : split_lines(output)) {
     std::istringstream stream(line);
@@ -1191,7 +1271,7 @@ std::vector<Neighbor> neighbor_entries(const std::string& iface) {
 }
 
 int ping_ttl(const std::string& iface, const std::string& ip) {
-  const std::string output = run_text({"ping", "-I", iface, "-c", "1", "-W", "1", ip}, 1.5);
+  const std::string output = run_text({"ping", "-I", iface, "-c", "1", "-W", "1", ip}, 1.5, scan_wait_tick);
   std::regex ttl_regex(R"(\bttl=(\d+))", std::regex::icase);
   std::smatch match;
   if (std::regex_search(output, match, ttl_regex)) {
@@ -1307,13 +1387,14 @@ Discovery sniff(const std::string& iface, double timeout_sec, const Options& opt
   size_t parsed_packets = 0;
   const auto deadline = std::chrono::steady_clock::now() +
       std::chrono::milliseconds(static_cast<int>(std::max(0.1, timeout_sec) * 1000.0));
-  auto next_repaint = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+  auto next_repaint = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   while (std::chrono::steady_clock::now() < deadline) {
     throw_if_interrupted();
     const auto loop_now = std::chrono::steady_clock::now();
     if (loop_now >= next_repaint) {
-      repaint_scan_screen();
-      next_repaint = loop_now + std::chrono::milliseconds(250);
+      scan_wait_tick();
+      throw_if_interrupted();
+      next_repaint = loop_now + std::chrono::milliseconds(100);
     }
     fd_set read_set;
     FD_ZERO(&read_set);
@@ -1550,24 +1631,67 @@ std::vector<std::string> render_candidate_rows(
     size_t max_rows,
     int width) {
   std::vector<std::string> rows;
-  rows.reserve(max_rows + 4);
-  rows.push_back("上下方向键移动，空格选择/取消，回车确认，a 显示/隐藏低优先级候选，q 或 Esc 退出。");
-  rows.push_back("");
-  const int path_width = std::max(10, width - 39);
-  for (size_t i = first; i < visible_states.size() && rows.size() < max_rows + 2; ++i) {
+  rows.reserve(max_rows + 2);
+  const int inner_width = std::max(8, width - 4);
+  const int filename_width = neon::clamp_int(inner_width - 47, 18, 42);
+  const int parent_width = std::max(8, inner_width - filename_width - 40);
+  rows.push_back(
+      neon::text("SEL", neon::Color::Muted, true) + "  " +
+      neon::text("STATE", neon::Color::Muted, true) + "   " +
+      neon::pad_right("FILE", filename_width) + " " +
+      neon::pad_right("CURRENT", 15) + " " +
+      "LOCATION");
+  for (size_t i = first; i < visible_states.size() && rows.size() < max_rows + 1; ++i) {
     const auto& state = visible_states[i];
     const bool active = i == cursor;
     const bool is_checked = state.original_index < checked.size() && checked[state.original_index];
     const std::string marker = active ? neon::text("▶", neon::Color::Accent, true) : " ";
     const std::string check = is_checked ? neon::text("[x]", neon::Color::Success, true) : "[ ]";
     const std::string index = neon::pad_left(std::to_string(i + 1), 2);
-    const std::string group = neon::text(neon::pad_right(i < labels.size() ? labels[i] : "候选", 8), neon::Color::Muted, true);
-    const std::string status = neon::text(neon::pad_right(status_plain(state.status), 7), status_color_for(state.status), true);
-    rows.push_back(marker + " " + check + " " + index + " " + group + " " + status + " " +
-                   neon::fit(compact_path(state.path, static_cast<size_t>(path_width)), path_width));
+    const std::string status = neon::text(neon::pad_right(status_plain(state.status), 6), status_color_for(state.status), true);
+    const std::string filename = neon::fit(path_filename(state.path), filename_width);
+    const std::string current = state.configured_ip.empty() ? "N/A" : state.configured_ip;
+    const std::string parent = compact_parent_path(state.path, static_cast<size_t>(parent_width));
+    rows.push_back(
+        marker + " " + check + " " + index + " " + status + " " +
+        neon::pad_right(filename, filename_width) + " " +
+        neon::pad_right(neon::fit(current, 15), 15) + " " +
+        neon::fit(parent, parent_width));
   }
   if (visible_states.empty()) {
     rows.push_back(neon::text("当前可见列表为空。", neon::Color::Warning, true));
+  }
+  return rows;
+}
+
+std::vector<std::string> selected_config_detail_rows(
+    const ConfigState& state,
+    const DetectionSummary& summary,
+    const std::vector<bool>& checked,
+    int width) {
+  const bool is_checked = state.original_index < checked.size() && checked[state.original_index];
+  std::vector<std::string> rows;
+  const std::string action = is_checked ? "SELECTED" : "not selected";
+  rows.push_back(
+      "ACTION       " +
+      neon::text(action, is_checked ? neon::Color::Success : neon::Color::Muted, true) +
+      "   " +
+      neon::text(status_plain(state.status), status_color_for(state.status), true));
+  rows.push_back("FILE         " + path_filename(state.path));
+  rows.push_back(
+      "CURRENT IP   " +
+      neon::text(state.configured_ip.empty() ? "N/A" : state.configured_ip,
+                 state.configured_ip == summary.result.lidar_ip ? neon::Color::Success : neon::Color::Warning,
+                 true) +
+      "   TARGET " +
+      neon::text(summary.result.lidar_ip.empty() ? "N/A" : summary.result.lidar_ip, neon::Color::Success, true));
+  rows.push_back(
+      "PRIORITY     " +
+      std::string(state.low_priority ? "low-priority/sample path" : "normal"));
+  rows.push_back("PATH");
+  const int path_width = std::max(8, width - 4);
+  for (const auto& line : wrap_path_for_display(state.path, static_cast<size_t>(path_width), 3)) {
+    rows.push_back("  " + line);
   }
   return rows;
 }
@@ -1584,8 +1708,7 @@ std::string render_config_picker(
   const neon::Size term = neon::terminal_size();
   const int width = std::max(48, term.cols);
   std::ostringstream out;
-  out << neon::clear_screen()
-      << neon::header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width);
+  out << neon::header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width);
   int used_rows = 3;
   if (term.rows < 16 || term.cols < 58) {
     neon::append_line(out, neon::text("Terminal too small for Autoconfig TUI", neon::Color::Warning, true), width, used_rows);
@@ -1595,18 +1718,18 @@ std::string render_config_picker(
   }
 
   const size_t selected_count = static_cast<size_t>(std::count(checked.begin(), checked.end(), true));
-  const std::string selection_line = "VISIBLE " + std::to_string(visible_states.size()) +
-      " / TOTAL " + std::to_string(states.size()) +
-      " / SELECTED " + std::to_string(selected_count);
+  const std::string selection_line = "VISIBLE      " + std::to_string(visible_states.size()) +
+      "/" + std::to_string(states.size());
+  const std::string selected_line = "SELECTED     " + std::to_string(selected_count);
   const std::string hidden_line = view.hidden_count == 0
-      ? "LOW PRIORITY shown"
-      : "LOW PRIORITY folded: " + std::to_string(view.hidden_count) + " (press a)";
-
+      ? "LOW-PRIORITY shown"
+      : "LOW-PRIORITY hidden " + std::to_string(view.hidden_count);
   if (term.cols >= 104) {
     const int gap = 1;
-    const int left_w = neon::clamp_int(term.cols / 3, 33, 44);
+    const int left_w = neon::clamp_int(term.cols / 4, 30, 40);
     const int right_w = std::max(58, term.cols - left_w - gap);
-    const int max_candidate_rows = std::max(1, term.rows - used_rows - 6);
+    const int detail_rows = visible_states.empty() ? 0 : 8;
+    const int max_candidate_rows = neon::clamp_int(term.rows - used_rows - detail_rows - 5, 6, 14);
     size_t first = 0;
     if (!visible_states.empty() && cursor >= static_cast<size_t>(max_candidate_rows)) {
       first = cursor - static_cast<size_t>(max_candidate_rows) + 1;
@@ -1614,6 +1737,7 @@ std::string render_config_picker(
     std::vector<std::string> left_rows = detection_rows(summary);
     left_rows.push_back("");
     left_rows.push_back(selection_line);
+    left_rows.push_back(selected_line);
     left_rows.push_back(hidden_line);
     auto left = neon::box("DEVICE IDENTITY", left_rows, left_w);
     auto right = neon::box(
@@ -1621,6 +1745,13 @@ std::string render_config_picker(
         render_candidate_rows(visible_states, labels, checked, cursor, first, static_cast<size_t>(max_candidate_rows), right_w),
         right_w);
     neon::append_lines(out, neon::hstack(left, right, left_w, right_w, gap), width, term.rows - used_rows - 2, used_rows);
+    if (!visible_states.empty() && used_rows < term.rows - 2) {
+      const auto detail = neon::box(
+          "SELECTED CONFIG",
+          selected_config_detail_rows(visible_states[cursor], summary, checked, width),
+          width);
+      neon::append_lines(out, detail, width, term.rows - used_rows - 2, used_rows);
+    }
   } else {
     const int panel_w = width;
     const int detection_budget = std::min(7, std::max(3, term.rows / 4));
@@ -1629,12 +1760,13 @@ std::string render_config_picker(
       top_rows.resize(static_cast<size_t>(detection_budget));
     }
     top_rows.push_back(selection_line);
+    top_rows.push_back(selected_line);
     top_rows.push_back(hidden_line);
     const auto identity = neon::box("DEVICE IDENTITY", top_rows, panel_w);
     if (term.rows - used_rows - 2 >= static_cast<int>(identity.size()) + 5) {
       neon::append_lines(out, identity, width, term.rows - used_rows - 2, used_rows);
     }
-    const int max_candidate_rows = std::max(1, term.rows - used_rows - 6);
+    const int max_candidate_rows = neon::clamp_int(term.rows - used_rows - 10, 5, 10);
     size_t first = 0;
     if (!visible_states.empty() && cursor >= static_cast<size_t>(max_candidate_rows)) {
       first = cursor - static_cast<size_t>(max_candidate_rows) + 1;
@@ -1649,14 +1781,20 @@ std::string render_config_picker(
         term.rows - used_rows - 2,
         used_rows);
   }
-  if (!visible_states.empty() && used_rows < term.rows - 1) {
-    neon::append_line(
-        out,
-        neon::text("PATH ", neon::Color::Muted, true) + neon::fit(visible_states[cursor].path, std::max(8, width - 5)),
-        width,
-        used_rows);
+  if (term.cols < 104 && !visible_states.empty() && used_rows < term.rows - 2) {
+    const auto detail = neon::box(
+        "SELECTED CONFIG",
+        selected_config_detail_rows(visible_states[cursor], summary, checked, width),
+        width);
+    neon::append_lines(out, detail, width, term.rows - used_rows - 2, used_rows);
   }
-  neon::append_footer_at_bottom(out, "[↑/↓] MOVE   [SPACE] SELECT   [A] LOW-PRIORITY   [ENTER] APPLY   [Q/ESC] QUIT", term.rows, width, used_rows);
+  neon::append_footer_at_bottom(
+      out,
+      "[↑/↓] MOVE   [SPACE] SELECT   [A] LOW-PRIORITY   [ENTER] APPLY   [Q/ESC] QUIT",
+      term.rows,
+      width,
+      used_rows);
+  out << neon::bg() << "\033[J";
   return out.str();
 }
 
@@ -1754,6 +1892,8 @@ void enter_screen() {
   set_noecho_input();
   std::cout << neon::enter_alt_screen() << std::flush;
   g_screen_active = true;
+  g_scan_renderer.reset();
+  g_scan_frame_clock.reset();
 }
 
 void leave_screen() {
@@ -1766,6 +1906,7 @@ void leave_screen() {
     g_has_original_termios = false;
   }
   std::cout << neon::leave_alt_screen() << std::flush;
+  g_scan_renderer.reset();
 }
 
 std::vector<size_t> choose_configs_interactively(
@@ -1815,8 +1956,11 @@ std::vector<size_t> choose_configs_interactively(
     print_config_table(states, initial_show_all);
     return {};
   }
-  g_has_original_termios = true;
-  g_original_termios = original;
+  const bool restore_local_termios = !g_has_original_termios;
+  if (restore_local_termios) {
+    g_has_original_termios = true;
+    g_original_termios = original;
+  }
 
   size_t cursor = 0;
   bool show_all = initial_show_all;
@@ -1824,7 +1968,6 @@ std::vector<size_t> choose_configs_interactively(
   std::vector<bool> checked(checked_size_for_states(states), false);
   bool done = false;
   bool cancelled = false;
-
   auto redraw = [&]() {
     visible_states = flatten_config_view(make_config_view(states, show_all));
     if (visible_states.empty()) {
@@ -1832,8 +1975,10 @@ std::vector<size_t> choose_configs_interactively(
     } else if (cursor >= visible_states.size()) {
       cursor = visible_states.size() - 1;
     }
-    std::cout << render_config_picker(states, summary, show_all, cursor, checked);
-    std::cout.flush();
+    const neon::Size term = neon::terminal_size();
+    std::cout << neon::clear_screen()
+              << render_config_picker(states, summary, show_all, cursor, checked)
+              << std::flush;
   };
   redraw();
   while (!done) {
@@ -1865,8 +2010,9 @@ std::vector<size_t> choose_configs_interactively(
       redraw();
     }
   }
-  if (!g_has_original_termios) {
+  if (restore_local_termios) {
     tcsetattr(STDIN_FILENO, TCSANOW, &original);
+    g_has_original_termios = false;
   }
   std::cout << neon::clear_screen();
   if (cancelled) {
@@ -1972,9 +2118,14 @@ int main(int argc, char** argv) {
 
     if (result.lidar_ip.empty()) {
       if (interactive_picker) {
-        show_not_found_screen(summary);
+        const bool return_to_menu = show_not_found_screen(summary);
+        leave_screen();
+        if (return_to_menu) {
+          return kReturnToMenuCode;
+        }
+      } else {
+        leave_screen();
       }
-      leave_screen();
       if (!interactive_picker) {
         std::cerr << "ERROR: no MID360 lidar IP found by passive discovery or active scan\n";
       }

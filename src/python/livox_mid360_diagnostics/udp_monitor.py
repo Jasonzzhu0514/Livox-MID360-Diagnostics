@@ -77,6 +77,28 @@ class StreamStats:
     total_bytes: int = 0
 
 
+def snapshot_interval_stats(stats: dict[int, StreamStats]) -> dict[int, StreamStats]:
+    snapshot: dict[int, StreamStats] = {}
+    for key, item in stats.items():
+        snapshot[key] = StreamStats(
+            name=item.name,
+            port=item.port,
+            packets=item.packets,
+            units=item.units,
+            bytes=item.bytes,
+            last_data_type=item.last_data_type,
+            last_frame=item.last_frame,
+            last_udp_count=item.last_udp_count,
+            total_packets=item.total_packets,
+            total_units=item.total_units,
+            total_bytes=item.total_bytes,
+        )
+        item.packets = 0
+        item.units = 0
+        item.bytes = 0
+    return snapshot
+
+
 def load_ports(config_path: Path) -> dict[str, int]:
     data = json.loads(config_path.read_text(encoding="utf-8"))
     host_net_info = data.get("MID360", {}).get("host_net_info", {})
@@ -162,7 +184,7 @@ def stream_rate_rows(stats: dict[int, StreamStats], interval: float) -> list[str
 def render_dashboard(stats: dict[int, StreamStats], config_path: Path, elapsed: float, interval: float, args: argparse.Namespace) -> str:
     rows, cols = neon.terminal_size()
     width = max(48, cols)
-    out = [neon.clear_screen(), neon.header("LIVOX MID-360 UDP", "MONITOR", width)]
+    out = [neon.header("LIVOX MID-360 UDP", "MONITOR", width)]
     used_rows = 3
     if rows < 14 or cols < 62:
         used_rows += neon.append_line(out, neon.text("Terminal too small for UDP Monitor TUI", neon.WARNING, True), width)
@@ -210,11 +232,7 @@ def render_dashboard(stats: dict[int, StreamStats], config_path: Path, elapsed: 
 
 
 def poll_stdin_quit() -> bool:
-    readable, _, _ = select.select([sys.stdin], [], [], 0)
-    if not readable:
-        return False
-    ch = sys.stdin.read(1)
-    return ch in {"q", "Q", "\x03"}
+    return neon.read_key(0.0, 0.02) in {neon.KEY_QUIT, neon.KEY_ESCAPE}
 
 
 def monitor(args: argparse.Namespace) -> int:
@@ -245,16 +263,28 @@ def monitor(args: argparse.Namespace) -> int:
 
     started = time.monotonic()
     last_report = started
+    last_frame = started
+    last_interval = args.interval
+    report_stats = snapshot_interval_stats({id(sock): stat for sock, stat in sockets.items()})
     deadline = started + args.duration if args.duration > 0 else None
+    frame_interval = 1.0 / 20.0 if interactive else args.interval
+    renderer = neon.LineDiffRenderer()
+    interrupted = False
     try:
         if interactive:
-            print(render_dashboard({id(sock): stat for sock, stat in sockets.items()}, config_path, 0.0, args.interval, args), end="", flush=True)
+            rows, cols = neon.terminal_size()
+            renderer.render(
+                render_dashboard({id(sock): stat for sock, stat in sockets.items()}, config_path, 0.0, args.interval, args),
+                rows,
+                max(48, cols),
+            )
         while True:
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 break
 
-            timeout = min(0.25, max(0.0, args.interval - (now - last_report)))
+            next_wake = min(last_report + args.interval, last_frame + frame_interval) if interactive else last_report + args.interval
+            timeout = min(0.05 if interactive else 0.25, max(0.0, next_wake - now))
             readable, _, _ = select.select(list(sockets.keys()), [], [], timeout)
             for sock in readable:
                 try:
@@ -275,25 +305,29 @@ def monitor(args: argparse.Namespace) -> int:
                     stat.total_units += units or 0
 
             if interactive and poll_stdin_quit():
+                interrupted = True
                 break
 
             now = time.monotonic()
             if now - last_report >= args.interval:
                 interval = now - last_report
-                if interactive:
-                    print(render_dashboard({id(sock): stat for sock, stat in sockets.items()}, config_path, now - started, interval, args), end="", flush=True)
-                    for stat in sockets.values():
-                        stat.packets = 0
-                        stat.units = 0
-                        stat.bytes = 0
-                else:
-                    print(format_report({id(sock): stat for sock, stat in sockets.items()}, now - started, interval), flush=True)
+                last_interval = max(0.001, interval)
+                report_stats = snapshot_interval_stats({id(sock): stat for sock, stat in sockets.items()})
+                if not interactive:
+                    print(format_report(report_stats, now - started, interval), flush=True)
                 last_report = now
+            if interactive and now - last_frame >= frame_interval:
+                rows, cols = neon.terminal_size()
+                renderer.render(render_dashboard(report_stats, config_path, now - started, last_interval, args), rows, max(48, cols))
+                last_frame = now
     finally:
         if interactive:
             if original_termios is not None:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, original_termios)
             print(neon.leave_alt_screen(), end="", flush=True)
+    if interrupted:
+        print("Interrupted.", file=sys.stderr)
+        return 130
     print("stopped")
     return 0
 
@@ -323,7 +357,7 @@ def main() -> int:
     try:
         return monitor(args)
     except KeyboardInterrupt:
-        print("\nstopped")
+        print("Interrupted.", file=sys.stderr)
         return 130
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

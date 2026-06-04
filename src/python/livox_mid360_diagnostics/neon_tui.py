@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import sys
 import time
@@ -22,10 +23,120 @@ BG = "233"
 
 COLOR_ENABLED = True
 
+KEY_NONE = "none"
+KEY_UNKNOWN = "unknown"
+KEY_ENTER = "enter"
+KEY_QUIT = "quit"
+KEY_ESCAPE = "escape"
+KEY_UP = "up"
+KEY_DOWN = "down"
+KEY_LEFT = "left"
+KEY_RIGHT = "right"
+KEY_SPACE = "space"
+KEY_TOGGLE_ALL = "toggle_all"
+KEY_RESET = "reset"
+KEY_HELP = "help"
+KEY_MENU = "menu"
+
+
+class FrameClock:
+    def __init__(self, interval: float) -> None:
+        self.interval = max(0.001, interval)
+        self.reset()
+
+    def reset(self) -> None:
+        self.last_render = time.monotonic() - self.interval
+        self.dirty = True
+
+    def request_redraw(self) -> None:
+        self.dirty = True
+
+    def consume_redraw(self, heartbeat: bool = False) -> bool:
+        now = time.monotonic()
+        if (not self.dirty and not heartbeat) or now - self.last_render < self.interval:
+            return False
+        self.mark_rendered(now)
+        return True
+
+    def mark_rendered(self, now: float | None = None) -> None:
+        self.last_render = time.monotonic() if now is None else now
+        self.dirty = False
+
+    def wait_timeout(self, maximum: float) -> float:
+        remaining = self.interval - (time.monotonic() - self.last_render)
+        return max(0.0, min(maximum, remaining))
+
 
 def set_color_enabled(enabled: bool) -> None:
     global COLOR_ENABLED
     COLOR_ENABLED = enabled
+
+
+def read_char(timeout: float | None = 0.0) -> str:
+    if timeout is not None:
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            return ""
+    return sys.stdin.read(1)
+
+
+def read_key(timeout: float | None = 0.0, escape_timeout: float = 0.02) -> str:
+    ch = read_char(timeout)
+    if not ch:
+        return KEY_NONE
+    if ch in ("\n", "\r"):
+        return KEY_ENTER
+    if ch in {"q", "Q", "\x03"}:
+        return KEY_QUIT
+    if ch == " ":
+        return KEY_SPACE
+    if ch in {"a", "A"}:
+        return KEY_TOGGLE_ALL
+    if ch != "\x1b":
+        return KEY_UNKNOWN
+
+    prefix = read_char(escape_timeout)
+    if not prefix:
+        return KEY_ESCAPE
+    if prefix == "O":
+        code = read_char(escape_timeout)
+        return {
+            "P": KEY_HELP,
+            "A": KEY_UP,
+            "B": KEY_DOWN,
+            "C": KEY_RIGHT,
+            "D": KEY_LEFT,
+        }.get(code, KEY_UNKNOWN)
+    if prefix != "[":
+        return KEY_UNKNOWN
+
+    code = read_char(escape_timeout)
+    if code == "A":
+        return KEY_UP
+    if code == "B":
+        return KEY_DOWN
+    if code == "C":
+        return KEY_RIGHT
+    if code == "D":
+        return KEY_LEFT
+    if not code.isdigit():
+        return KEY_UNKNOWN
+
+    sequence = code
+    for _ in range(8):
+        nxt = read_char(escape_timeout)
+        if not nxt:
+            break
+        if nxt == "~":
+            if sequence in {"1", "11"}:
+                return KEY_HELP
+            if sequence == "15":
+                return KEY_RESET
+            if sequence == "21":
+                return KEY_MENU
+            return KEY_UNKNOWN
+        sequence += nxt
+    return KEY_UNKNOWN
 
 
 def color_enabled() -> bool:
@@ -129,6 +240,54 @@ def clear_screen() -> str:
     if color_enabled():
         return f"\033[48;5;{BG}m\033[38;5;{TEXT}m\033[2J\033[H"
     return "\033[2J\033[H"
+
+
+def home() -> str:
+    if color_enabled():
+        return f"\033[48;5;{BG}m\033[38;5;{TEXT}m\033[H"
+    return "\033[H"
+
+
+def cursor_to(row: int, col: int = 1) -> str:
+    return f"\033[{max(1, row)};{max(1, col)}H"
+
+
+def split_rendered_lines(frame: str) -> list[str]:
+    lines = frame.split("\n")
+    if lines and lines[-1] == "":
+        return lines
+    return lines or [""]
+
+
+class LineDiffRenderer:
+    def __init__(self) -> None:
+        self.previous: list[str] = []
+        self.previous_rows = -1
+        self.previous_cols = -1
+
+    def reset(self) -> None:
+        self.previous = []
+        self.previous_rows = -1
+        self.previous_cols = -1
+
+    def render(self, frame: str, rows: int, cols: int, force_full: bool = False) -> None:
+        lines = split_rendered_lines(frame)
+        resized = rows != self.previous_rows or cols != self.previous_cols
+        if force_full or resized or not self.previous:
+            out = [clear_screen()]
+            out.extend(line if index == 0 else "\n" + line for index, line in enumerate(lines))
+        else:
+            out = []
+            max_lines = max(len(lines), len(self.previous))
+            for index in range(max_lines):
+                current = lines[index] if index < len(lines) else blank_line(cols)
+                previous = self.previous[index] if index < len(self.previous) else ""
+                if current != previous:
+                    out.append(cursor_to(index + 1, 1) + current + "\033[K")
+        self.previous = lines
+        self.previous_rows = rows
+        self.previous_cols = cols
+        print("".join(out), end="", flush=True)
 
 
 def enter_alt_screen() -> str:

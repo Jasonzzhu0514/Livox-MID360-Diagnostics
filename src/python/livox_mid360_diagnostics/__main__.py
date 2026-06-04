@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import select
 import sys
 import termios
 import tty
@@ -27,7 +26,7 @@ def render_menu(cursor: int) -> str:
     rows, cols = neon.terminal_size()
     width = max(20, cols - 1)
     used_rows = 3
-    out = [neon.clear_screen(), neon.header("LIVOX MID-360 DIAGNOSTICS", "PYTHON", width)]
+    out = [neon.header("LIVOX MID-360 DIAGNOSTICS", "PYTHON", width)]
     if rows < 14 or cols < 58:
         used_rows += neon.append_line(out, neon.text("Terminal too small for Neon Protocol TUI", neon.WARNING, True), width)
         used_rows += neon.append_line(out, "Resize to at least 58x14.", width)
@@ -64,14 +63,6 @@ def render_menu(cursor: int) -> str:
     return "".join(out)
 
 
-def read_char(timeout: float | None = None) -> str:
-    if timeout is not None:
-        readable, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not readable:
-            return ""
-    return sys.stdin.read(1)
-
-
 def choose_command_menu() -> str:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         usage()
@@ -79,25 +70,33 @@ def choose_command_menu() -> str:
 
     original = termios.tcgetattr(sys.stdin.fileno())
     cursor = 0
+    frame_clock = neon.FrameClock(1.0)
+    renderer = neon.LineDiffRenderer()
+
+    def redraw() -> None:
+        rows, cols = neon.terminal_size()
+        renderer.render(render_menu(cursor), rows, max(20, cols - 1))
+        frame_clock.mark_rendered()
+
     try:
         tty.setcbreak(sys.stdin.fileno())
         print(neon.enter_alt_screen(), end="", flush=True)
+        redraw()
         while True:
-            print(render_menu(cursor), end="", flush=True)
-            ch = read_char()
-            if ch == "\x1b":
-                left = read_char(0.05)
-                right = read_char(0.05)
-                if left == "[" and right == "A":
-                    cursor = len(MENU_ITEMS) - 1 if cursor == 0 else cursor - 1
-                elif left == "[" and right == "B":
-                    cursor = (cursor + 1) % len(MENU_ITEMS)
-                else:
-                    return "quit"
-            elif ch in ("\n", "\r"):
+            key = neon.read_key(frame_clock.wait_timeout(0.02), 0.02)
+            if key == neon.KEY_NONE:
+                if frame_clock.consume_redraw(True):
+                    redraw()
+                continue
+            if key == neon.KEY_UP:
+                cursor = len(MENU_ITEMS) - 1 if cursor == 0 else cursor - 1
+            elif key == neon.KEY_DOWN:
+                cursor = (cursor + 1) % len(MENU_ITEMS)
+            elif key == neon.KEY_ENTER:
                 return MENU_ITEMS[cursor][0]
-            elif ch in {"q", "Q"}:
+            elif key in {neon.KEY_QUIT, neon.KEY_ESCAPE}:
                 return "quit"
+            redraw()
     finally:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, original)
         print(neon.leave_alt_screen(), end="", flush=True)
@@ -116,10 +115,16 @@ def main() -> int:
         command = sys.argv[1]
         sys.argv = [sys.argv[0], *sys.argv[2:]]
 
-    if command in {"autoconfig", "config"}:
-        return autoconfig.main()
-    if command in {"udp-monitor", "monitor"}:
-        return udp_monitor.main()
+    try:
+        if command in {"autoconfig", "config"}:
+            return autoconfig.main()
+        if command in {"udp-monitor", "monitor"}:
+            return udp_monitor.main()
+    except KeyboardInterrupt:
+        if command in {"autoconfig", "config"}:
+            autoconfig.leave_screen()
+        print("Interrupted.", file=sys.stderr)
+        return 130
 
     print(f"unknown command: {command}", file=sys.stderr)
     return 2

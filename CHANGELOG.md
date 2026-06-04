@@ -1,5 +1,20 @@
 # 更新日志
 
+## [1.2.0] - 2026-06-04
+### 新增
+- 新增共享 TUI 输入、刷新节流和逐行差分渲染工具，菜单、autoconfig、monitor、dump 和 Python fallback 统一复用。
+- autoconfig 和 monitor 在未发现雷达或 SDK 初始化失败时支持从结果页返回主菜单。
+### 优化
+- 大幅降低主菜单、扫描页、monitor live dashboard 和 dump TUI 的键盘延迟，避免界面刷新被右上角时间或阻塞扫描步骤拖慢。
+- 收紧 autoconfig 配置选择页布局，拆分文件名、当前 IP、路径位置和选中详情，footer 固定在终端底部。
+- monitor 从 discovery 切换到 live dashboard 时重置渲染状态，避免残留错误文本和旧帧。
+- dump 和 UDP monitor 使用独立统计快照与更高频 TUI 刷新，保持速率显示稳定。
+- 更新 GitHub Actions checkout/upload/download artifact 运行时，消除 Node.js 20 弃用告警。
+### 修复
+- 修复 autoconfig 和 monitor 退出行为不一致、无雷达结果页无法回主菜单的问题。
+- 修复 monitor SDK discovery 期间误报 `no MID360 lidar found` 的日志。
+- 修复 autoconfig 配置选择页快捷键提示重复、位置不固定以及长路径挤压候选列表的问题。
+
 ## [1.1.0] - 2026-06-01
 
 ### 新增

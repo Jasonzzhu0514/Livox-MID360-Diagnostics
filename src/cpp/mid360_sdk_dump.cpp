@@ -20,7 +20,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sys/select.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -28,6 +27,7 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kDumpTuiFrameSec = 1.0 / 20.0;
 
 struct Options {
   std::string config_path;
@@ -62,6 +62,7 @@ std::condition_variable g_cv;
 std::atomic<bool> g_running{true};
 std::atomic<bool> g_control_requested{false};
 std::atomic<bool> g_tui_active{false};
+neon::LineDiffRenderer g_tui_renderer;
 termios g_original_termios {};
 bool g_has_original_termios = false;
 
@@ -280,6 +281,7 @@ void enter_dump_tui() {
   }
   std::cout << neon::enter_alt_screen() << std::flush;
   g_tui_active = true;
+  g_tui_renderer.reset();
 }
 
 void leave_dump_tui() {
@@ -291,6 +293,7 @@ void leave_dump_tui() {
     g_has_original_termios = false;
   }
   std::cout << neon::leave_alt_screen() << std::flush;
+  g_tui_renderer.reset();
 }
 
 void request_controls(uint32_t handle) {
@@ -352,11 +355,11 @@ void push_msg_callback(const uint32_t handle, const uint8_t dev_type, const char
   request_controls(handle);
 }
 
-void print_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
-  const uint64_t packet_delta = now.point_packets - previous.point_packets;
-  const uint64_t point_delta = now.points - previous.points;
-  const uint64_t imu_packet_delta = now.imu_packets - previous.imu_packets;
-  const uint64_t imu_delta = now.imu_samples - previous.imu_samples;
+void print_report(const Stats& delta, const Stats& now, double interval, double elapsed) {
+  const uint64_t packet_delta = delta.point_packets;
+  const uint64_t point_delta = delta.points;
+  const uint64_t imu_packet_delta = delta.imu_packets;
+  const uint64_t imu_delta = delta.imu_samples;
   std::cout << "elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s"
             << " handle=" << now.handle
             << " sn=" << (now.sn.empty() ? "N/A" : now.sn)
@@ -366,7 +369,7 @@ void print_report(const Stats& previous, const Stats& now, double interval, doub
             << " total_points=" << now.points
             << " imu_packets=" << imu_packet_delta
             << " imu_rate=" << std::setprecision(1) << (imu_delta / interval) << " sample/s"
-            << " unsupported_packets=" << now.unsupported_packets
+            << " unsupported_packets=" << delta.unsupported_packets
             << std::endl;
 }
 
@@ -374,23 +377,14 @@ void handle_tui_input() {
   if (!g_tui_active.load()) {
     return;
   }
-  fd_set read_set;
-  FD_ZERO(&read_set);
-  FD_SET(STDIN_FILENO, &read_set);
-  timeval timeout {};
-  while (select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, &timeout) > 0) {
-    char ch = 0;
-    if (::read(STDIN_FILENO, &ch, 1) != 1) {
-      return;
-    }
-    if (ch == 3 || ch == 'q' || ch == 'Q') {
+  neon::Key key = neon::read_key(0, 20);
+  while (key != neon::Key::None) {
+    if (key == neon::Key::Quit || key == neon::Key::Escape) {
       g_running = false;
       g_cv.notify_all();
       return;
     }
-    FD_ZERO(&read_set);
-    FD_SET(STDIN_FILENO, &read_set);
-    timeout = timeval{};
+    key = neon::read_key(0, 20);
   }
 }
 
@@ -398,24 +392,16 @@ void wait_for_exit_key() {
   if (!isatty(STDIN_FILENO)) {
     return;
   }
-  termios original {};
-  if (tcgetattr(STDIN_FILENO, &original) != 0) {
+  neon::RawTerminal raw_terminal;
+  if (!raw_terminal.enter()) {
     return;
   }
-  termios raw = original;
-  raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
-  raw.c_cc[VMIN] = 1;
-  raw.c_cc[VTIME] = 0;
-  if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
-    return;
-  }
-  char ch = 0;
-  while (::read(STDIN_FILENO, &ch, 1) == 1) {
-    if (ch == '\n' || ch == '\r' || ch == 'q' || ch == 'Q' || ch == '\033') {
+  while (true) {
+    const neon::Key key = neon::read_key(-1, 20);
+    if (key == neon::Key::Enter || key == neon::Key::Quit || key == neon::Key::Escape) {
       break;
     }
   }
-  tcsetattr(STDIN_FILENO, TCSANOW, &original);
 }
 
 std::vector<std::string> dump_identity_rows(const Stats& now, double elapsed) {
@@ -467,13 +453,13 @@ void print_dump_error_screen(const std::string& message) {
   wait_for_exit_key();
 }
 
-void print_tui_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
+void print_tui_report(const Stats& delta, const Stats& now, double interval, double elapsed) {
   const neon::Size term = neon::terminal_size();
   const int width = std::max(48, term.cols);
-  const uint64_t point_delta = now.points - previous.points;
-  const uint64_t packet_delta = now.point_packets - previous.point_packets;
-  const uint64_t imu_delta = now.imu_samples - previous.imu_samples;
-  const uint64_t imu_packet_delta = now.imu_packets - previous.imu_packets;
+  const uint64_t point_delta = delta.points;
+  const uint64_t packet_delta = delta.point_packets;
+  const uint64_t imu_delta = delta.imu_samples;
+  const uint64_t imu_packet_delta = delta.imu_packets;
   const double point_rate = point_delta / std::max(0.001, interval);
   const double imu_rate = imu_delta / std::max(0.001, interval);
   const double progress_by_time = g_options.duration_sec > 0.0 ? elapsed / g_options.duration_sec : 0.0;
@@ -483,15 +469,14 @@ void print_tui_report(const Stats& previous, const Stats& now, double interval, 
       : std::max(progress_by_time, progress_by_points);
 
   std::ostringstream out;
-  out << neon::clear_screen()
-      << neon::header("LIVOX MID-360 DUMP", "CAPTURE", width);
+  out << neon::header("LIVOX MID-360 DUMP", "CAPTURE", width);
   int used_rows = 3;
   if (term.rows < 16 || term.cols < 64) {
     neon::append_line(out, neon::text("Terminal too small for Dump TUI", neon::Color::Warning, true), width, used_rows);
     neon::append_line(out, "Resize to at least 64x16.", width, used_rows);
     neon::append_line(out, "points=" + std::to_string(now.points) + " imu_samples=" + std::to_string(now.imu_samples), width, used_rows);
     neon::append_footer_at_bottom(out, "[CTRL+C/Q] STOP", term.rows, width, used_rows);
-    std::cout << out.str() << std::flush;
+    g_tui_renderer.render(out.str(), term.rows, width);
     return;
   }
 
@@ -502,7 +487,7 @@ void print_tui_report(const Stats& previous, const Stats& now, double interval, 
       "IMU_RATE     " + neon::text(format_rate(imu_rate, "sample/s"), imu_rate > 0.0 ? neon::Color::Success : neon::Color::Muted, true),
       "IMU_PKTS     " + format_rate(imu_packet_delta / std::max(0.001, interval), "pkt/s"),
       "TOTAL_IMU    " + std::to_string(now.imu_samples),
-      "UNSUPPORTED  " + std::to_string(now.unsupported_packets),
+      "UNSUPPORTED  " + std::to_string(delta.unsupported_packets),
   };
   const int bar_width = std::max(8, width - 20);
   std::vector<std::string> progress_rows = {
@@ -540,14 +525,14 @@ void print_tui_report(const Stats& previous, const Stats& now, double interval, 
     neon::append_lines(out, neon::box("CAPTURE STREAM", rows, width), width, term.rows - used_rows - 1, used_rows);
   }
   neon::append_footer_at_bottom(out, "[CTRL+C/Q] STOP", term.rows, width, used_rows);
-  std::cout << out.str() << std::flush;
+  g_tui_renderer.render(out.str(), term.rows, width);
 }
 
-void print_dump_report(const Stats& previous, const Stats& now, double interval, double elapsed) {
+void print_dump_report(const Stats& delta, const Stats& now, double interval, double elapsed) {
   if (g_tui_active.load()) {
-    print_tui_report(previous, now, interval, elapsed);
+    print_tui_report(delta, now, interval, elapsed);
   } else {
-    print_report(previous, now, interval, elapsed);
+    print_report(delta, now, interval, elapsed);
   }
 }
 
@@ -671,20 +656,56 @@ int main(int argc, char** argv) {
 
     const auto started = std::chrono::steady_clock::now();
     auto last = started;
+    const auto report_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(g_options.interval_sec));
+    const auto frame_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(g_tui_active.load() ? kDumpTuiFrameSec : g_options.interval_sec));
+    auto next_report = started + report_interval;
+    auto next_frame = started + frame_interval;
     Stats previous;
+    Stats last_delta;
+    double last_interval = g_options.interval_sec;
     while (g_running) {
       std::unique_lock<std::mutex> lock(g_mutex);
-      g_cv.wait_for(lock, std::chrono::milliseconds(static_cast<int>(g_options.interval_sec * 1000.0)));
+      const auto wake_at = g_tui_active.load() ? std::min(next_report, next_frame) : next_report;
+      g_cv.wait_until(lock, wake_at, [] {
+        return !g_running.load();
+      });
       const auto now_time = std::chrono::steady_clock::now();
-      const double interval = std::chrono::duration<double>(now_time - last).count();
       const double elapsed = std::chrono::duration<double>(now_time - started).count();
       Stats snapshot = g_stats;
       lock.unlock();
 
       handle_tui_input();
-      print_dump_report(previous, snapshot, std::max(0.001, interval), elapsed);
-      previous = snapshot;
-      last = now_time;
+      if (!g_running) {
+        break;
+      }
+      if (next_report <= now_time) {
+        const double interval = std::chrono::duration<double>(now_time - last).count();
+        last_delta.point_packets = snapshot.point_packets - previous.point_packets;
+        last_delta.points = snapshot.points - previous.points;
+        last_delta.imu_packets = snapshot.imu_packets - previous.imu_packets;
+        last_delta.imu_samples = snapshot.imu_samples - previous.imu_samples;
+        last_delta.unsupported_packets = snapshot.unsupported_packets - previous.unsupported_packets;
+        last_delta.handle = snapshot.handle;
+        last_delta.sn = snapshot.sn;
+        last_delta.lidar_ip = snapshot.lidar_ip;
+        last_interval = std::max(0.001, interval);
+        previous = snapshot;
+        last = now_time;
+        while (next_report <= now_time) {
+          next_report += report_interval;
+        }
+        if (!g_tui_active.load()) {
+          print_dump_report(last_delta, snapshot, last_interval, elapsed);
+        }
+      }
+      if (g_tui_active.load() && next_frame <= now_time) {
+        print_dump_report(last_delta, snapshot, last_interval, elapsed);
+        while (next_frame <= now_time) {
+          next_frame += frame_interval;
+        }
+      }
       if (g_options.duration_sec > 0.0 && elapsed >= g_options.duration_sec) {
         break;
       }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sys/ioctl.h>
+#include <sys/select.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -9,6 +11,7 @@
 #include <cstring>
 #include <ctime>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -29,6 +32,244 @@ struct Size {
   int rows = 24;
   int cols = 80;
 };
+
+enum class Key {
+  None,
+  Unknown,
+  Enter,
+  Quit,
+  Escape,
+  Up,
+  Down,
+  Left,
+  Right,
+  Space,
+  ToggleAll,
+  Reset,
+  Help,
+  Menu,
+  Back,
+};
+
+class FrameClock {
+ public:
+  explicit FrameClock(std::chrono::milliseconds interval)
+      : interval_(std::max(std::chrono::milliseconds(1), interval)) {
+    reset();
+  }
+
+  void reset() {
+    last_render_ = Clock::now() - interval_;
+    dirty_ = true;
+  }
+
+  void request_redraw() {
+    dirty_ = true;
+  }
+
+  bool dirty() const {
+    return dirty_;
+  }
+
+  bool consume_redraw(bool heartbeat = false) {
+    const auto now = Clock::now();
+    if ((!dirty_ && !heartbeat) || now - last_render_ < interval_) {
+      return false;
+    }
+    mark_rendered(now);
+    return true;
+  }
+
+  void mark_rendered() {
+    mark_rendered(Clock::now());
+  }
+
+  int wait_ms(int max_wait_ms) const {
+    const auto now = Clock::now();
+    const auto next = last_render_ + interval_;
+    const auto remaining = next <= now
+        ? std::chrono::milliseconds(0)
+        : std::chrono::duration_cast<std::chrono::milliseconds>(next - now);
+    return std::max(0, std::min(static_cast<int>(remaining.count()), std::max(0, max_wait_ms)));
+  }
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  void mark_rendered(Clock::time_point now) {
+    last_render_ = now;
+    dirty_ = false;
+  }
+
+  std::chrono::milliseconds interval_;
+  Clock::time_point last_render_;
+  bool dirty_ = true;
+};
+
+class RawTerminal {
+ public:
+  RawTerminal() = default;
+  RawTerminal(const RawTerminal&) = delete;
+  RawTerminal& operator=(const RawTerminal&) = delete;
+
+  ~RawTerminal() {
+    restore();
+  }
+
+  bool enter(int fd = STDIN_FILENO, bool nonblocking = false) {
+    if (active_) {
+      return true;
+    }
+    fd_ = fd;
+    if (!isatty(fd_) || tcgetattr(fd_, &original_) != 0) {
+      return false;
+    }
+    termios raw = original_;
+    raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
+    raw.c_cc[VMIN] = nonblocking ? 0 : 1;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(fd_, TCSANOW, &raw) != 0) {
+      return false;
+    }
+    active_ = true;
+    return true;
+  }
+
+  void restore() {
+    if (!active_) {
+      return;
+    }
+    tcsetattr(fd_, TCSANOW, &original_);
+    active_ = false;
+  }
+
+  bool active() const {
+    return active_;
+  }
+
+ private:
+  int fd_ = STDIN_FILENO;
+  termios original_ {};
+  bool active_ = false;
+};
+
+inline bool read_char_timeout(char& out, int timeout_ms) {
+  fd_set read_set;
+  FD_ZERO(&read_set);
+  FD_SET(STDIN_FILENO, &read_set);
+  timeval timeout {};
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_usec = (timeout_ms % 1000) * 1000;
+  const int ready = select(STDIN_FILENO + 1, &read_set, nullptr, nullptr, timeout_ms < 0 ? nullptr : &timeout);
+  return ready > 0 && ::read(STDIN_FILENO, &out, 1) == 1;
+}
+
+inline Key read_key(int timeout_ms = 0, int escape_timeout_ms = 20) {
+  char ch = 0;
+  if (!read_char_timeout(ch, timeout_ms)) {
+    return Key::None;
+  }
+  if (ch == '\n' || ch == '\r') {
+    return Key::Enter;
+  }
+  if (ch == 'q' || ch == 'Q') {
+    return Key::Quit;
+  }
+  if (ch == ' ') {
+    return Key::Space;
+  }
+  if (ch == 'a' || ch == 'A') {
+    return Key::ToggleAll;
+  }
+  if (ch == 'm' || ch == 'M') {
+    return Key::Menu;
+  }
+  if (ch == 'b' || ch == 'B') {
+    return Key::Back;
+  }
+  if (ch == 3) {
+    return Key::Quit;
+  }
+  if (ch != '\033') {
+    return Key::Unknown;
+  }
+
+  char prefix = 0;
+  if (!read_char_timeout(prefix, escape_timeout_ms)) {
+    return Key::Escape;
+  }
+  if (prefix == 'O') {
+    char code = 0;
+    if (!read_char_timeout(code, escape_timeout_ms)) {
+      return Key::Unknown;
+    }
+    switch (code) {
+      case 'P':
+        return Key::Help;
+      case 'Q':
+        return Key::Unknown;
+      case 'R':
+        return Key::Unknown;
+      case 'S':
+        return Key::Unknown;
+      case 'A':
+        return Key::Up;
+      case 'B':
+        return Key::Down;
+      case 'C':
+        return Key::Right;
+      case 'D':
+        return Key::Left;
+      default:
+        return Key::Unknown;
+    }
+  }
+  if (prefix != '[') {
+    return Key::Unknown;
+  }
+
+  char code = 0;
+  if (!read_char_timeout(code, escape_timeout_ms)) {
+    return Key::Unknown;
+  }
+  switch (code) {
+    case 'A':
+      return Key::Up;
+    case 'B':
+      return Key::Down;
+    case 'C':
+      return Key::Right;
+    case 'D':
+      return Key::Left;
+    default:
+      break;
+  }
+  if (code < '0' || code > '9') {
+    return Key::Unknown;
+  }
+
+  std::string sequence(1, code);
+  for (int i = 0; i < 8; ++i) {
+    char next = 0;
+    if (!read_char_timeout(next, escape_timeout_ms)) {
+      break;
+    }
+    if (next == '~') {
+      if (sequence == "11" || sequence == "1") {
+        return Key::Help;
+      }
+      if (sequence == "15") {
+        return Key::Reset;
+      }
+      if (sequence == "21") {
+        return Key::Menu;
+      }
+      return Key::Unknown;
+    }
+    sequence.push_back(next);
+  }
+  return Key::Unknown;
+}
 
 inline bool& color_override() {
   static bool enabled = true;
@@ -400,6 +641,78 @@ inline std::string leave_alt_screen() {
 inline std::string clear_screen() {
   return color_enabled() ? "\033[48;5;233m\033[38;5;252m\033[2J\033[H" : "\033[2J\033[H";
 }
+
+inline std::string home() {
+  return color_enabled() ? "\033[48;5;233m\033[38;5;252m\033[H" : "\033[H";
+}
+
+inline std::string blank_line(int width);
+
+inline std::string cursor_to(int row, int col = 1) {
+  row = std::max(1, row);
+  col = std::max(1, col);
+  return "\033[" + std::to_string(row) + ";" + std::to_string(col) + "H";
+}
+
+inline std::vector<std::string> split_rendered_lines(const std::string& frame) {
+  std::vector<std::string> lines;
+  std::string current;
+  for (char ch : frame) {
+    if (ch == '\n') {
+      lines.push_back(current);
+      current.clear();
+    } else {
+      current.push_back(ch);
+    }
+  }
+  if (!current.empty() || frame.empty() || frame.back() == '\n') {
+    lines.push_back(current);
+  }
+  return lines;
+}
+
+class LineDiffRenderer {
+ public:
+  void reset() {
+    previous_.clear();
+    previous_rows_ = -1;
+    previous_cols_ = -1;
+  }
+
+  void render(const std::string& frame, int rows, int cols, bool force_full = false) {
+    const std::vector<std::string> lines = split_rendered_lines(frame);
+    const bool resized = rows != previous_rows_ || cols != previous_cols_;
+    std::ostringstream out;
+    if (force_full || resized || previous_.empty()) {
+      out << clear_screen();
+      for (size_t i = 0; i < lines.size(); ++i) {
+        if (i) {
+          out << "\n";
+        }
+        out << lines[i];
+      }
+    } else {
+      const size_t max_lines = std::max(lines.size(), previous_.size());
+      for (size_t i = 0; i < max_lines; ++i) {
+        const std::string current = i < lines.size() ? lines[i] : blank_line(cols);
+        const std::string previous = i < previous_.size() ? previous_[i] : std::string();
+        if (current == previous) {
+          continue;
+        }
+        out << cursor_to(static_cast<int>(i) + 1, 1) << current << "\033[K";
+      }
+    }
+    previous_ = lines;
+    previous_rows_ = rows;
+    previous_cols_ = cols;
+    std::cout << out.str() << std::flush;
+  }
+
+ private:
+  std::vector<std::string> previous_;
+  int previous_rows_ = -1;
+  int previous_cols_ = -1;
+};
 
 inline std::string blank_line(int width) {
   return color_enabled() ? "\033[48;5;233m" + std::string(static_cast<size_t>(std::max(1, width)), ' ') + reset_bg()

@@ -20,6 +20,7 @@ import subprocess
 import sys
 import termios
 import tempfile
+import time
 import tty
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ MID360_CONFIG_KEYS = ("MID360", "Mid360s")
 SCREEN_ACTIVE = False
 SCAN_LINES: list[str] = []
 ORIGINAL_TERMIOS = None
+SCAN_RENDERER = neon.LineDiffRenderer()
 
 
 SDK_QUERY_MAIN_CPP = r'''
@@ -458,25 +460,75 @@ def append_method(method: str, suffix: str) -> str:
     return f"{method}+{suffix}" if method else suffix
 
 
+def scan_wait_tick() -> None:
+    if not SCREEN_ACTIVE:
+        return
+    key = neon.read_key(0.0, 0.02)
+    if key in {neon.KEY_QUIT, neon.KEY_ESCAPE}:
+        raise KeyboardInterrupt
+    render_scan_screen()
+
+
 def run_text(command: list[str], timeout: float | None = None) -> str:
+    if not SCREEN_ACTIVE:
+        try:
+            proc = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = exc.stderr or ""
+            if isinstance(stdout, bytes):
+                stdout = stdout.decode(errors="replace")
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            return stdout + stderr
+        return proc.stdout + proc.stderr
+
+    deadline = time.monotonic() + timeout if timeout is not None else None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return stdout + stderr
-    return proc.stdout + proc.stderr
+    except OSError:
+        return ""
+
+    chunks: list[str] = []
+    try:
+        while True:
+            if SCREEN_ACTIVE:
+                scan_wait_tick()
+            if proc.poll() is not None:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                break
+            time.sleep(0.05 if SCREEN_ACTIVE else 0.02)
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            proc.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
+
+    stdout, stderr = proc.communicate()
+    chunks.append(stdout or "")
+    chunks.append(stderr or "")
+    return "".join(chunks)
 
 
 def iface_ipv4(iface: str) -> str | None:
@@ -553,13 +605,12 @@ def render_scan_screen(message: str | None = None) -> None:
     width = max(40, cols)
     max_lines = max(3, rows - 8)
     visible = SCAN_LINES[-max_lines:] or [f"{neon.text('扫描', neon.ACCENT, True)} preparing autoconfig"]
-    out = [neon.clear_screen(), neon.header("LIVOX MID-360 AUTOCONFIG", "SCAN", width)]
+    out = [neon.header("LIVOX MID-360 AUTOCONFIG", "SCAN", width)]
     used_rows = 3
     panel = neon.box("DISCOVERY TRACE", visible, width)
     used_rows += neon.append_lines(out, panel, width, rows - used_rows - 1)
     neon.append_footer_at_bottom(out, "[CTRL+C] STOP", rows, width, used_rows)
-    print("".join(out), end="")
-    sys.stdout.flush()
+    SCAN_RENDERER.render("".join(out), rows, width)
 
 
 def progress(message: str) -> None:
@@ -1331,7 +1382,7 @@ def render_config_picker(
     labels = visible_group_labels(view)
     rows, cols = neon.terminal_size()
     width = max(48, cols)
-    out = [neon.clear_screen(), neon.header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width)]
+    out = [neon.header("LIVOX MID-360 AUTOCONFIG", "CONFIG", width)]
     used_rows = 3
     if rows < 16 or cols < 58:
         used_rows += neon.append_line(out, neon.text("Terminal too small for Autoconfig TUI", neon.WARNING, True), width)
@@ -1383,6 +1434,7 @@ def enter_screen() -> None:
     print(neon.enter_alt_screen(), end="")
     sys.stdout.flush()
     SCREEN_ACTIVE = True
+    SCAN_RENDERER.reset()
 
 
 def leave_screen() -> None:
@@ -1395,6 +1447,7 @@ def leave_screen() -> None:
         ORIGINAL_TERMIOS = None
     print(neon.leave_alt_screen(), end="")
     sys.stdout.flush()
+    SCAN_RENDERER.reset()
 
 
 def choose_configs_interactively(
@@ -1426,6 +1479,7 @@ def choose_configs_interactively(
     show_all = initial_show_all
     visible_states = flatten_config_view(make_config_view(config_states, show_all))
     cursor = 0
+    renderer = neon.LineDiffRenderer()
 
     def redraw() -> None:
         nonlocal cursor, visible_states
@@ -1434,48 +1488,43 @@ def choose_configs_interactively(
             cursor = 0
         elif cursor >= len(visible_states):
             cursor = len(visible_states) - 1
-        print(render_config_picker(config_states, iface, result, show_all, cursor, selected), end="")
-        sys.stdout.flush()
-
-    def read_char(timeout: float | None = None) -> str:
-        if timeout is not None:
-            readable, _, _ = select.select([sys.stdin], [], [], timeout)
-            if not readable:
-                return ""
-        return sys.stdin.read(1)
+        rows, cols = neon.terminal_size()
+        renderer.render(render_config_picker(config_states, iface, result, show_all, cursor, selected), rows, max(48, cols))
 
     original = termios.tcgetattr(sys.stdin.fileno())
     cancelled = False
+    frame_clock = neon.FrameClock(1.0)
     try:
         tty.setcbreak(sys.stdin.fileno())
         redraw()
+        frame_clock.mark_rendered()
         while True:
-            ch = read_char()
-            if ch == "\x1b":
-                left = read_char(0.05)
-                right = read_char(0.05)
-                if left == "[" and right == "A":
-                    if visible_states:
-                        cursor = len(visible_states) - 1 if cursor == 0 else cursor - 1
-                elif left == "[" and right == "B":
-                    if visible_states:
-                        cursor = (cursor + 1) % len(visible_states)
-                else:
-                    cancelled = True
-                    break
-            elif ch == " ":
+            key = neon.read_key(frame_clock.wait_timeout(0.02), 0.02)
+            if key == neon.KEY_NONE:
+                if frame_clock.consume_redraw(True):
+                    redraw()
+                    frame_clock.mark_rendered()
+                continue
+            if key == neon.KEY_UP:
+                if visible_states:
+                    cursor = len(visible_states) - 1 if cursor == 0 else cursor - 1
+            elif key == neon.KEY_DOWN:
+                if visible_states:
+                    cursor = (cursor + 1) % len(visible_states)
+            elif key == neon.KEY_SPACE:
                 if visible_states:
                     original_index = visible_states[cursor].original_index
                     if original_index < len(selected):
                         selected[original_index] = not selected[original_index]
-            elif ch in ("\n", "\r"):
+            elif key == neon.KEY_ENTER:
                 break
-            elif ch in ("a", "A"):
+            elif key == neon.KEY_TOGGLE_ALL:
                 show_all = not show_all
-            elif ch in ("q", "Q"):
+            elif key in {neon.KEY_QUIT, neon.KEY_ESCAPE}:
                 cancelled = True
                 break
             redraw()
+            frame_clock.mark_rendered()
     finally:
         if ORIGINAL_TERMIOS is None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, original)
