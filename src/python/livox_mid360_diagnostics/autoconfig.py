@@ -22,6 +22,7 @@ import termios
 import tempfile
 import time
 import tty
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,7 @@ CONFIG_SEARCH_ROOT_ENV = "LIVOX_MID360_SEARCH_ROOTS"
 SDK_SEARCH_ROOT_ENV = "LIVOX_SDK_SEARCH_ROOTS"
 SDK_QUERY_CACHE_ENV = "LIVOX_MID360_SDK_QUERY_CACHE"
 MID360_CONFIG_KEYS = ("MID360", "Mid360s")
+DEFAULT_LIVOX_HOST_IP = "192.168.1.5"
 
 SCREEN_ACTIVE = False
 SCAN_LINES: list[str] = []
@@ -424,6 +426,14 @@ class Discovery:
 
 
 @dataclass
+class InterfaceCandidate:
+    name: str
+    ip: str | None = None
+    prefix: int | None = None
+    auto_bind: bool = False
+
+
+@dataclass
 class ConfigState:
     path: Path
     configured_ip: str | None
@@ -559,14 +569,116 @@ def list_ipv4_interfaces() -> list[tuple[str, str, int]]:
     return interfaces
 
 
-def candidate_ifaces(requested_iface: str, config_paths: list[Path]) -> list[str]:
+def ethernet_like_iface(iface: str) -> bool:
+    return iface.startswith(("eth", "en", "eno", "ens", "enp", "enx"))
+
+
+def list_link_interfaces() -> list[tuple[str, bool]]:
+    output = run_text(["ip", "-o", "link", "show"])
+    links: list[tuple[str, bool]] = []
+    for line in output.splitlines():
+        match = re.search(r"^\d+:\s+([^:@\s]+)(?:@[^:]+)?:\s+<([^>]*)>", line)
+        if not match:
+            continue
+        iface, flags_text = match.groups()
+        if iface == "lo" or iface.startswith(("docker", "br-", "veth", "virbr")):
+            continue
+        flags = set(flags_text.split(","))
+        if "UP" not in flags:
+            continue
+        links.append((iface, "LOWER_UP" in flags or "RUNNING" in flags))
+    return links
+
+
+def iface_has_livox_subnet_ip(iface: str) -> bool:
+    return any(name == iface and ip.startswith("192.168.1.") for name, ip, _ in list_ipv4_interfaces())
+
+
+def iface_has_ip(iface: str, ip: str) -> bool:
+    return any(name == iface and existing_ip == ip for name, existing_ip, _ in list_ipv4_interfaces())
+
+
+def iface_has_any_ipv4(iface: str) -> bool:
+    return any(name == iface for name, _, _ in list_ipv4_interfaces())
+
+
+def ip_assigned_anywhere(ip: str) -> bool:
+    return any(existing_ip == ip for _, existing_ip, _ in list_ipv4_interfaces())
+
+
+def choose_livox_host_ip(preferred: str = DEFAULT_LIVOX_HOST_IP) -> str:
+    if preferred.startswith("192.168.1.") and not ip_assigned_anywhere(preferred):
+        return preferred
+    preferred_hosts = [5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230, 240, 250]
+    for host in preferred_hosts:
+        candidate = f"192.168.1.{host}"
+        if not ip_assigned_anywhere(candidate):
+            return candidate
+    for host in range(2, 255):
+        candidate = f"192.168.1.{host}"
+        if not ip_assigned_anywhere(candidate):
+            return candidate
+    return preferred
+
+
+@contextmanager
+def temporary_livox_ipv4(iface: str, ip: str, prefix: int = 24):
+    if iface_has_ip(iface, ip):
+        yield False
+        return
+    cidr = f"{ip}/{prefix}"
+    add_command = ["ip", "addr", "add", cidr, "dev", iface]
+    del_command = ["ip", "addr", "del", cidr, "dev", iface]
+    status = subprocess.run(add_command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    used_sudo = False
+    if status != 0 and hasattr(os, "geteuid") and os.geteuid() != 0 and shutil.which("sudo"):
+        status = subprocess.run(["sudo", "-n", *add_command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+        used_sudo = status == 0
+    if status != 0:
+        raise RuntimeError(f"failed to add {cidr} to {iface}; run: sudo ip addr add {cidr} dev {iface}")
+    try:
+        yield True
+    finally:
+        cleanup = ["sudo", "-n", *del_command] if used_sudo else del_command
+        subprocess.run(cleanup, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def sorted_candidate_links() -> list[tuple[str, bool]]:
+    links = list_link_interfaces()
+    links.sort(
+        key=lambda item: (
+            not iface_has_any_ipv4(item[0]),
+            item[1],
+            ethernet_like_iface(item[0]),
+            item[0],
+        ),
+        reverse=True,
+    )
+    return links
+
+
+def candidate_ifaces(
+    requested_iface: str,
+    config_paths: list[Path],
+    auto_bind: bool = True,
+    auto_bind_ip: str = DEFAULT_LIVOX_HOST_IP,
+) -> list[InterfaceCandidate]:
     if requested_iface.strip().lower() != "auto":
-        return [requested_iface]
+        candidates: list[InterfaceCandidate] = []
+        info = next((item for item in list_ipv4_interfaces() if item[0] == requested_iface), None)
+        if auto_bind and not iface_has_livox_subnet_ip(requested_iface):
+            candidates.append(InterfaceCandidate(requested_iface, choose_livox_host_ip(auto_bind_ip), 24, True))
+        if info:
+            candidates.append(InterfaceCandidate(info[0], info[1], info[2], False))
+        return candidates or [InterfaceCandidate(requested_iface)]
 
     configured_ips = [read_config_lidar_ip(path) for path in config_paths]
     configured_ips = [ip for ip in configured_ips if ip]
     interfaces = list_ipv4_interfaces()
-    candidates: list[str] = []
+    candidates: list[InterfaceCandidate] = []
+
+    def has_candidate(iface_name: str) -> bool:
+        return any(item.name == iface_name for item in candidates)
 
     for configured_ip in configured_ips:
         try:
@@ -575,21 +687,23 @@ def candidate_ifaces(requested_iface: str, config_paths: list[Path]) -> list[str
             continue
         for iface, host_ip, prefix in interfaces:
             network = ipaddress.ip_network(f"{host_ip}/{prefix}", strict=False)
-            if lidar_addr in network and iface not in candidates:
-                candidates.append(iface)
+            if lidar_addr in network and not has_candidate(iface):
+                candidates.append(InterfaceCandidate(iface, host_ip, prefix, False))
 
-    ethernet_like = [
-        iface
-        for iface, _, _ in interfaces
-        if iface.startswith(("eth", "en", "eno", "ens", "enp"))
-    ]
-    for iface in ethernet_like:
-        if iface not in candidates:
-            candidates.append(iface)
-    for iface, _, _ in interfaces:
-        if iface not in candidates:
-            candidates.append(iface)
-    return candidates or ["eth0"]
+    if auto_bind and not any(ip.startswith("192.168.1.") for _, ip, _ in interfaces):
+        host_ip = choose_livox_host_ip(auto_bind_ip)
+        for iface, _lower_up in sorted_candidate_links():
+            if ethernet_like_iface(iface) and not iface_has_livox_subnet_ip(iface) and not has_candidate(iface):
+                candidates.append(InterfaceCandidate(iface, host_ip, 24, True))
+
+    ethernet_like = [(iface, ip, prefix) for iface, ip, prefix in interfaces if ethernet_like_iface(iface)]
+    for iface, ip, prefix in ethernet_like:
+        if not has_candidate(iface):
+            candidates.append(InterfaceCandidate(iface, ip, prefix, False))
+    for iface, ip, prefix in interfaces:
+        if not has_candidate(iface):
+            candidates.append(InterfaceCandidate(iface, ip, prefix, False))
+    return candidates or [InterfaceCandidate("eth0")]
 
 
 def verbose_print(enabled: bool, message: str) -> None:
@@ -1099,29 +1213,57 @@ def query_sn_by_sdk(config_paths: list[Path], lidar_ip: str, iface_ip: str | Non
     return None
 
 
-def discover(ifaces: list[str], timeout_sec: float, sudo: bool, verbose: bool = False) -> tuple[str, Discovery]:
+def discover(ifaces: list[InterfaceCandidate], timeout_sec: float, sudo: bool, verbose: bool = False) -> tuple[str, Discovery]:
     if not ifaces:
-        ifaces = ["eth0"]
+        ifaces = [InterfaceCandidate("eth0")]
     per_iface_timeout = timeout_sec if len(ifaces) == 1 else max(1.5, min(timeout_sec, 2.0))
     last_result = Discovery()
-    progress(f"candidate interfaces: {', '.join(ifaces)}")
-    for iface in ifaces:
-        progress(f"checking interface {iface} by active scan")
-        verbose_print(verbose, f"active scan iface={iface}")
-        result = active_scan(iface, verbose=verbose)
-        if result.lidar_ip:
-            progress(f"found lidar by active scan on {iface}: {result.lidar_ip}")
-            return iface, result
-        last_result = result
-    for iface in ifaces:
-        progress(f"checking interface {iface} by passive discovery fallback")
-        verbose_print(verbose, f"try iface={iface}")
-        result = sniff(iface, per_iface_timeout, sudo=sudo, verbose=verbose)
-        if result.lidar_ip:
-            progress(f"found lidar by passive discovery on {iface}: {result.lidar_ip}")
-            return iface, result
-        last_result = result
-    return ifaces[-1], last_result
+    progress(
+        "candidate interfaces: "
+        + ", ".join(
+            f"{item.name} ({item.ip}/24 auto-bind)" if item.auto_bind else item.name
+            for item in ifaces
+        )
+    )
+    for candidate in ifaces:
+        try:
+            context = (
+                temporary_livox_ipv4(candidate.name, candidate.ip or DEFAULT_LIVOX_HOST_IP, candidate.prefix or 24)
+                if candidate.auto_bind
+                else nullcontext(False)
+            )
+            with context as added:
+                if added:
+                    progress(f"temporarily added {candidate.ip}/{candidate.prefix or 24} to {candidate.name}")
+                progress(f"checking interface {candidate.name} by active scan")
+                verbose_print(verbose, f"active scan iface={candidate.name}")
+                result = active_scan(candidate.name, verbose=verbose)
+                if result.lidar_ip:
+                    progress(f"found lidar by active scan on {candidate.name}: {result.lidar_ip}")
+                    return candidate.name, result
+                last_result = result
+        except RuntimeError as exc:
+            progress(f"auto-bind warning: {exc}")
+    for candidate in ifaces:
+        try:
+            context = (
+                temporary_livox_ipv4(candidate.name, candidate.ip or DEFAULT_LIVOX_HOST_IP, candidate.prefix or 24)
+                if candidate.auto_bind
+                else nullcontext(False)
+            )
+            with context as added:
+                if added:
+                    progress(f"temporarily added {candidate.ip}/{candidate.prefix or 24} to {candidate.name}")
+                progress(f"checking interface {candidate.name} by passive discovery fallback")
+                verbose_print(verbose, f"try iface={candidate.name}")
+                result = sniff(candidate.name, per_iface_timeout, sudo=sudo, verbose=verbose)
+                if result.lidar_ip:
+                    progress(f"found lidar by passive discovery on {candidate.name}: {result.lidar_ip}")
+                    return candidate.name, result
+                last_result = result
+        except RuntimeError as exc:
+            progress(f"auto-bind warning: {exc}")
+    return ifaces[-1].name, last_result
 
 
 def update_config(path: Path, lidar_ip: str, host_ip: str | None = None) -> None:
@@ -1563,6 +1705,12 @@ def main() -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="print detailed sniff/parse diagnostics")
     parser.add_argument("--no-sudo", action="store_true", help="do not prefix tcpdump with sudo")
     parser.add_argument(
+        "--auto-bind-ip",
+        default=DEFAULT_LIVOX_HOST_IP,
+        help="temporary host IP for 192.168.1.x lidar NICs (default: 192.168.1.5)",
+    )
+    parser.add_argument("--no-auto-bind", action="store_true", help="do not temporarily add 192.168.1.x/24 to candidate NICs")
+    parser.add_argument(
         "--config",
         action="append",
         default=None,
@@ -1597,6 +1745,12 @@ def main() -> int:
     parser.add_argument("--show-all", action="store_true", help="include sample/build/dist config candidates in the picker")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
     args = parser.parse_args()
+    try:
+        auto_bind_ip = ipaddress.ip_address(args.auto_bind_ip)
+    except ValueError:
+        parser.error("--auto-bind-ip must be a valid IPv4 address")
+    if not str(auto_bind_ip).startswith("192.168.1."):
+        parser.error("--auto-bind-ip must be in 192.168.1.x")
     init_theme(args.no_color)
     neon.set_color_enabled(not args.no_color)
     interactive_picker = not args.apply and sys.stdin.isatty() and sys.stdout.isatty()
@@ -1604,10 +1758,15 @@ def main() -> int:
         enter_screen()
         render_scan_screen("preparing config search")
     config_paths = resolve_config_paths(args.config, verbose=args.verbose)
-    ifaces = candidate_ifaces(args.iface, config_paths)
+    ifaces = candidate_ifaces(
+        args.iface,
+        config_paths,
+        auto_bind=not args.no_auto_bind,
+        auto_bind_ip=str(auto_bind_ip),
+    )
     progress("starting MID360 discovery")
     if args.verbose:
-        verbose_print(True, f"candidate ifaces: {ifaces}")
+        verbose_print(True, f"candidate ifaces: {[candidate.__dict__ for candidate in ifaces]}")
 
     iface, result = discover(ifaces, args.timeout, sudo=not args.no_sudo, verbose=args.verbose)
     if result.lidar_ip and not result.broadcast_code and not args.no_log_sn:

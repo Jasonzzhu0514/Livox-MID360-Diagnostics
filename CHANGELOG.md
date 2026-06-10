@@ -1,5 +1,16 @@
 # 更新日志
 
+## [1.3.0] - 2026-06-10
+### 新增
+- monitor 和 C++/Python autoconfig 支持在未绑定 `192.168.1.x` 时为候选有线网卡临时添加 `192.168.1.5/24`，并提供 `--auto-bind-ip` 和 `--no-auto-bind` 控制。
+- 交互式 TUI 启动时会尝试把终端窗口放大到推荐尺寸，并支持 `LIVOX_MID360_TERMINAL_SIZE` 和 `LIVOX_MID360_RESIZE_TERMINAL` 配置。
+### 优化
+- 抽出 C++ 网络自动绑定 helper，统一网卡枚举、候选排序、临时 IPv4 生命周期和免密 sudo 调用。
+- 更新 README 和部署文档，说明默认分支 raw 下载、192.168.1.x 网段绑定和终端尺寸调整方法。
+### 修复
+- 修复 README 和部署文档中的 GitHub raw URL 写死 `main` 导致 Release 下载脚本 404 的问题。
+- 修复 monitor TUI 在窄窗口下 `NETWORK`、`DEVICE IDENTITY` 和 `STREAM STATUS` 面板内容越过边框的问题。
+- 修复已连接雷达但有线网卡没有 MID360 默认网段时，monitor 和 autoconfig 无法发现 `192.168.1.x` 雷达的问题。
 ## [1.2.0] - 2026-06-04
 ### 新增
 - 新增共享 TUI 输入、刷新节流和逐行差分渲染工具，菜单、autoconfig、monitor、dump 和 Python fallback 统一复用。

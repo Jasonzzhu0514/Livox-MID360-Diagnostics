@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace neon {
@@ -304,6 +306,84 @@ inline Size terminal_size() {
     }
   }
   return size;
+}
+
+inline bool env_is_false(const char* value) {
+  if (!value || std::strlen(value) == 0) {
+    return false;
+  }
+  std::string lowered(value);
+  std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::tolower(ch));
+  });
+  return lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off";
+}
+
+inline bool parse_positive_int(const std::string& value, int& out) {
+  if (value.empty()) {
+    return false;
+  }
+  char* end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 10);
+  if (end != value.c_str() + value.size() || parsed <= 0 || parsed > 1000) {
+    return false;
+  }
+  out = static_cast<int>(parsed);
+  return true;
+}
+
+inline Size preferred_terminal_size(int default_rows = 40, int default_cols = 132) {
+  Size target;
+  target.rows = default_rows;
+  target.cols = default_cols;
+
+  if (const char* value = std::getenv("LIVOX_MID360_TERMINAL_SIZE")) {
+    const std::string spec(value);
+    const size_t separator = spec.find_first_of("xX,");
+    if (separator != std::string::npos) {
+      int cols = 0;
+      int rows = 0;
+      if (parse_positive_int(spec.substr(0, separator), cols) &&
+          parse_positive_int(spec.substr(separator + 1), rows)) {
+        target.cols = cols;
+        target.rows = rows;
+      }
+    }
+  }
+  if (const char* value = std::getenv("LIVOX_MID360_TERMINAL_COLS")) {
+    int cols = 0;
+    if (parse_positive_int(value, cols)) {
+      target.cols = cols;
+    }
+  }
+  if (const char* value = std::getenv("LIVOX_MID360_TERMINAL_ROWS")) {
+    int rows = 0;
+    if (parse_positive_int(value, rows)) {
+      target.rows = rows;
+    }
+  }
+  return target;
+}
+
+inline void ensure_terminal_size(int min_rows = 40, int min_cols = 132) {
+  if (!isatty(STDOUT_FILENO) || env_is_false(std::getenv("LIVOX_MID360_RESIZE_TERMINAL"))) {
+    return;
+  }
+  const char* term = std::getenv("TERM");
+  if (!term || std::strcmp(term, "dumb") == 0) {
+    return;
+  }
+
+  const Size current = terminal_size();
+  Size target = preferred_terminal_size(min_rows, min_cols);
+  target.rows = std::max(target.rows, min_rows);
+  target.cols = std::max(target.cols, min_cols);
+  if (current.rows >= target.rows && current.cols >= target.cols) {
+    return;
+  }
+
+  std::cout << "\033[8;" << target.rows << ";" << target.cols << "t" << std::flush;
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
 }
 
 inline int clamp_int(int value, int low, int high) {

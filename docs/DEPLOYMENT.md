@@ -88,7 +88,7 @@ source scripts/prepare_config.sh
 正式 Release 会由 GitHub Actions 在 Ubuntu 20.04 基线环境中自动生成 `x86_64` 和 `aarch64` 预编译二进制，不需要把 `dist/prebuilt/` 提交进仓库。目标设备优先直接下载最新 Release：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/HEAD/scripts/use_cpp_release.sh)
 ./livox_mid360_diagnostics
 ```
 
@@ -174,6 +174,16 @@ SDK 回调统计：
 ```
 
 交互终端中 `monitor` 会显示设备侧栏、点云/IMU 速率条、点云密度预览和模块诊断，画面约 20 FPS 原地刷新；`--interval` 控制速率统计窗口。通过非交互 SSH 或日志管道运行时，会改为每个 interval 输出一行摘要，避免把整屏仪表盘反复追加到终端。`DEVICE/status` 表示 SDK 回调是否还在更新，断网或拔网口后会变为 `LOST`；`DEVICE/health` 表示雷达上报的诊断码。
+
+MID360 默认使用 `192.168.1.x` 网段。`monitor` 和 C++/Python `autoconfig` 在没有发现本机 `192.168.1.x` 地址时，会把已连接的有线网卡纳入候选，并尝试临时添加 `192.168.1.5/24`。`monitor` 会在运行期间保留这个地址以接收 SDK 回调，退出时清理；`autoconfig` 只在扫描阶段临时使用。权限不足时先手动执行：
+
+```bash
+sudo ip addr add 192.168.1.5/24 dev eth0
+```
+
+可用 `--auto-bind-ip 192.168.1.20` 修改临时主机 IP，或用 `--no-auto-bind` 关闭自动绑定。
+
+交互式 TUI 启动时会尝试把终端窗口放大到 `132x40`。可用 `LIVOX_MID360_TERMINAL_SIZE=140x45` 指定目标尺寸，格式是 `列x行`；可用 `LIVOX_MID360_RESIZE_TERMINAL=0` 关闭自动调整。部分终端、tmux、VS Code 内置终端或 SSH 客户端可能会忽略窗口大小控制序列，这种情况下需要手动放大窗口或用终端启动参数指定 geometry。
 
 不通过 ROS 解析并导出短时点云/IMU CSV：
 

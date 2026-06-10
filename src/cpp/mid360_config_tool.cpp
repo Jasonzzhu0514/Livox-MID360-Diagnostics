@@ -1,4 +1,5 @@
 #include "neon_tui.hpp"
+#include "network_autobind.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -58,6 +59,8 @@ struct Options {
   bool require_match = false;
   bool show_all = false;
   bool no_color = false;
+  bool auto_bind_livox_subnet = true;
+  std::string auto_bind_ip = "192.168.1.5";
   std::vector<std::string> configs;
 };
 
@@ -93,6 +96,13 @@ struct ConfigView {
 struct DetectionSummary {
   std::string iface;
   Discovery result;
+};
+
+struct InterfaceCandidate {
+  std::string name;
+  std::string ip;
+  int prefix = 0;
+  bool auto_bind_livox_subnet = false;
 };
 
 std::vector<std::string> detection_rows(const DetectionSummary& summary);
@@ -993,30 +1003,9 @@ bool ip_in_network(const std::string& ip, const std::string& host_ip, int prefix
 
 std::vector<InterfaceInfo> list_ipv4_interfaces() {
   std::vector<InterfaceInfo> interfaces;
-  ifaddrs* ifaddr = nullptr;
-  if (getifaddrs(&ifaddr) != 0) {
-    return interfaces;
+  for (const auto& item : mid360_net::list_ipv4_interfaces()) {
+    interfaces.push_back({item.name, item.ip, item.prefix});
   }
-  for (ifaddrs* item = ifaddr; item != nullptr; item = item->ifa_next) {
-    if (!item->ifa_addr || item->ifa_addr->sa_family != AF_INET) {
-      continue;
-    }
-    const std::string name = item->ifa_name;
-    if (name == "lo" || name.rfind("docker", 0) == 0) {
-      continue;
-    }
-    char addr[INET_ADDRSTRLEN]{};
-    auto* sin = reinterpret_cast<sockaddr_in*>(item->ifa_addr);
-    inet_ntop(AF_INET, &sin->sin_addr, addr, sizeof(addr));
-
-    int prefix = 24;
-    if (item->ifa_netmask) {
-      auto* mask = reinterpret_cast<sockaddr_in*>(item->ifa_netmask);
-      prefix = __builtin_popcount(ntohl(mask->sin_addr.s_addr));
-    }
-    interfaces.push_back({name, addr, prefix});
-  }
-  freeifaddrs(ifaddr);
   return interfaces;
 }
 
@@ -1137,10 +1126,21 @@ std::vector<std::string> resolve_config_paths(const Options& options) {
   return {"MID360_config.json"};
 }
 
-std::vector<std::string> candidate_ifaces(const Options& options, const std::vector<std::string>& config_paths) {
+std::vector<InterfaceCandidate> candidate_ifaces(const Options& options, const std::vector<std::string>& config_paths) {
   if (options.iface != "auto") {
     progress("using explicit interface: " + options.iface);
-    return {options.iface};
+    const auto interfaces = list_ipv4_interfaces();
+    std::vector<InterfaceCandidate> candidates;
+    auto found = std::find_if(interfaces.begin(), interfaces.end(), [&](const InterfaceInfo& item) {
+      return item.name == options.iface;
+    });
+    if (!mid360_net::iface_has_livox_subnet_ip(options.iface) && options.auto_bind_livox_subnet) {
+      candidates.push_back({options.iface, mid360_net::choose_livox_host_ip(options.auto_bind_ip), 24, true});
+    }
+    if (found != interfaces.end()) {
+      candidates.push_back({found->name, found->ip, found->prefix, false});
+    }
+    return candidates.empty() ? std::vector<InterfaceCandidate>{{options.iface, "", 0, false}} : candidates;
   }
   const auto interfaces = list_ipv4_interfaces();
   if (interfaces.empty()) {
@@ -1152,7 +1152,12 @@ std::vector<std::string> candidate_ifaces(const Options& options, const std::vec
     }
     progress("available IPv4 interfaces: " + join_strings(descriptions));
   }
-  std::vector<std::string> candidates;
+  std::vector<InterfaceCandidate> candidates;
+  auto has_candidate = [&](const std::string& name) {
+    return std::any_of(candidates.begin(), candidates.end(), [&](const InterfaceCandidate& item) {
+      return item.name == name;
+    });
+  };
   for (const auto& path : config_paths) {
     const std::string lidar_ip = read_config_lidar_ip(path);
     if (lidar_ip.empty()) {
@@ -1166,27 +1171,51 @@ std::vector<std::string> candidate_ifaces(const Options& options, const std::vec
     }
     for (const auto& iface : interfaces) {
       if (ip_in_network(lidar_ip, iface.ip, iface.prefix) &&
-          std::find(candidates.begin(), candidates.end(), iface.name) == candidates.end()) {
-        candidates.push_back(iface.name);
+          !has_candidate(iface.name)) {
+        candidates.push_back({iface.name, iface.ip, iface.prefix, false});
         progress("interface " + iface.name + " matches configured lidar network");
       }
     }
   }
-  for (const auto& iface : interfaces) {
-    if ((iface.name.rfind("eth", 0) == 0 || iface.name.rfind("en", 0) == 0) &&
-        std::find(candidates.begin(), candidates.end(), iface.name) == candidates.end()) {
-      candidates.push_back(iface.name);
+  if (options.auto_bind_livox_subnet &&
+      std::none_of(interfaces.begin(), interfaces.end(), [](const InterfaceInfo& item) {
+        return mid360_net::livox_subnet_ip(item.ip);
+      })) {
+    const std::string host_ip = mid360_net::choose_livox_host_ip(options.auto_bind_ip);
+    for (const auto& link : mid360_net::sorted_candidate_links()) {
+      if (!mid360_net::ethernet_like_name(link.name) ||
+          mid360_net::iface_has_livox_subnet_ip(link.name) ||
+          has_candidate(link.name)) {
+        continue;
+      }
+      candidates.push_back({link.name, host_ip, 24, true});
     }
   }
   for (const auto& iface : interfaces) {
-    if (std::find(candidates.begin(), candidates.end(), iface.name) == candidates.end()) {
-      candidates.push_back(iface.name);
+    if (mid360_net::ethernet_like_name(iface.name) && !has_candidate(iface.name)) {
+      candidates.push_back({iface.name, iface.ip, iface.prefix, false});
+    }
+  }
+  for (const auto& iface : interfaces) {
+    if (!has_candidate(iface.name)) {
+      candidates.push_back({iface.name, iface.ip, iface.prefix, false});
     }
   }
   if (candidates.empty()) {
-    candidates.push_back("eth0");
+    candidates.push_back({"eth0", "", 0, false});
   }
-  progress("interface scan order: " + join_strings(candidates));
+  std::vector<std::string> names;
+  for (const auto& candidate : candidates) {
+    std::string text = candidate.name;
+    if (!candidate.ip.empty()) {
+      text += "=" + candidate.ip + "/" + std::to_string(candidate.prefix);
+    }
+    if (candidate.auto_bind_livox_subnet) {
+      text += " auto-bind=" + candidate.ip + "/24";
+    }
+    names.push_back(text);
+  }
+  progress("interface scan order: " + join_strings(names));
   return candidates;
 }
 
@@ -1451,7 +1480,7 @@ Discovery sniff(const std::string& iface, double timeout_sec, const Options& opt
   return result;
 }
 
-std::pair<std::string, Discovery> discover(const std::vector<std::string>& ifaces, const Options& options) {
+std::pair<std::string, Discovery> discover(const std::vector<InterfaceCandidate>& ifaces, const Options& options) {
   Discovery last;
   progress("candidate interfaces: " + [&]() {
     std::ostringstream out;
@@ -1459,32 +1488,53 @@ std::pair<std::string, Discovery> discover(const std::vector<std::string>& iface
       if (i) {
         out << ", ";
       }
-      out << ifaces[i];
+      out << ifaces[i].name;
+      if (ifaces[i].auto_bind_livox_subnet) {
+        out << " (" << ifaces[i].ip << "/24 auto-bind)";
+      }
     }
     return out.str();
   }());
-  for (const auto& iface : ifaces) {
-    progress("checking interface " + iface + " by active scan");
-    Discovery result = active_scan(iface, options);
-    if (!result.lidar_ip.empty()) {
-      progress("found lidar by active scan on " + iface + ": " + result.lidar_ip);
-      return {iface, result};
+  for (const auto& candidate : ifaces) {
+    mid360_net::TemporaryIpv4Address temporary_host;
+    if (candidate.auto_bind_livox_subnet) {
+      std::string error;
+      if (!temporary_host.add(candidate.name, candidate.ip, candidate.prefix, error)) {
+        progress("auto-bind warning: " + error);
+        continue;
+      }
+      progress("temporarily added " + temporary_host.cidr() + " to " + candidate.name);
     }
-    progress("active scan on " + iface + " did not identify MID360");
+    progress("checking interface " + candidate.name + " by active scan");
+    Discovery result = active_scan(candidate.name, options);
+    if (!result.lidar_ip.empty()) {
+      progress("found lidar by active scan on " + candidate.name + ": " + result.lidar_ip);
+      return {candidate.name, result};
+    }
+    progress("active scan on " + candidate.name + " did not identify MID360");
     last = result;
   }
   const double per_iface_timeout = ifaces.size() == 1 ? options.timeout_sec : std::max(1.5, std::min(options.timeout_sec, 2.0));
-  for (const auto& iface : ifaces) {
-    progress("checking interface " + iface + " by passive discovery fallback");
-    Discovery result = sniff(iface, per_iface_timeout, options);
-    if (!result.lidar_ip.empty()) {
-      progress("found lidar by passive discovery on " + iface + ": " + result.lidar_ip);
-      return {iface, result};
+  for (const auto& candidate : ifaces) {
+    mid360_net::TemporaryIpv4Address temporary_host;
+    if (candidate.auto_bind_livox_subnet) {
+      std::string error;
+      if (!temporary_host.add(candidate.name, candidate.ip, candidate.prefix, error)) {
+        progress("auto-bind warning: " + error);
+        continue;
+      }
+      progress("temporarily added " + temporary_host.cidr() + " to " + candidate.name);
     }
-    progress("passive discovery on " + iface + " did not identify MID360");
+    progress("checking interface " + candidate.name + " by passive discovery fallback");
+    Discovery result = sniff(candidate.name, per_iface_timeout, options);
+    if (!result.lidar_ip.empty()) {
+      progress("found lidar by passive discovery on " + candidate.name + ": " + result.lidar_ip);
+      return {candidate.name, result};
+    }
+    progress("passive discovery on " + candidate.name + " did not identify MID360");
     last = result;
   }
-  return {ifaces.empty() ? "eth0" : ifaces.back(), last};
+  return {ifaces.empty() ? "eth0" : ifaces.back().name, last};
 }
 
 std::vector<size_t> parse_selection(const std::string& answer, size_t count) {
@@ -1889,6 +1939,7 @@ void enter_screen() {
   if (!isatty(STDOUT_FILENO)) {
     return;
   }
+  neon::ensure_terminal_size();
   set_noecho_input();
   std::cout << neon::enter_alt_screen() << std::flush;
   g_screen_active = true;
@@ -2042,6 +2093,8 @@ void usage(const char* argv0) {
       << "  --yes                   do not prompt when used with --apply\n"
       << "  --require-match         return non-zero if config is unavailable/mismatched\n"
       << "  --show-all              include sample/build/dist config candidates in the picker\n"
+      << "  --auto-bind-ip IP       temporary host IP for 192.168.1.x lidar NICs (default: 192.168.1.5)\n"
+      << "  --no-auto-bind          do not temporarily add 192.168.1.x/24 to candidate NICs\n"
       << "  --no-color              disable ANSI colors\n"
       << "  --no-sudo               do not prefix tcpdump with sudo\n"
       << "  -v, --verbose           print debug output\n"
@@ -2079,11 +2132,18 @@ Options parse_args(int argc, char** argv) {
       options.require_match = true;
     } else if (arg == "--show-all") {
       options.show_all = true;
+    } else if (arg == "--auto-bind-ip") {
+      options.auto_bind_ip = need_value(arg);
+    } else if (arg == "--no-auto-bind") {
+      options.auto_bind_livox_subnet = false;
     } else if (arg == "--no-color") {
       options.no_color = true;
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }
+  }
+  if (!mid360_net::valid_ipv4(options.auto_bind_ip) || !mid360_net::livox_subnet_ip(options.auto_bind_ip)) {
+    throw std::runtime_error("--auto-bind-ip must be in 192.168.1.x");
   }
   return options;
 }

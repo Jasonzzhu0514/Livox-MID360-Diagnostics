@@ -17,7 +17,7 @@ C++ CLI 是推荐主路径。它直接走 Livox-SDK2 discovery，不要求提前
 目标设备上可以自动下载当前架构的单体程序并运行：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/HEAD/scripts/use_cpp_release.sh)
 ./livox_mid360_diagnostics
 ```
 
@@ -67,6 +67,31 @@ bash scripts/use_cpp_release.sh
 
 ```bash
 ./livox_mid360_diagnostics monitor --iface eth0
+```
+
+MID360 默认在 `192.168.1.x` 网段。如果已连接雷达的网卡没有这个 IPv4 网段，`monitor` / `autoconfig` 会优先尝试给候选网卡临时添加 `192.168.1.5/24`，程序退出时清理。这个动作需要 root 权限或免密 sudo；权限不足时可以先手动绑定：
+
+```bash
+sudo ip addr add 192.168.1.5/24 dev eth0
+```
+
+需要指定临时主机 IP 或关闭自动绑定时：
+
+```bash
+./livox_mid360_diagnostics monitor --auto-bind-ip 192.168.1.20
+./livox_mid360_diagnostics monitor --no-auto-bind
+```
+
+交互式 TUI 启动时会尝试把终端窗口放大到 `132x40`。如果当前终端模拟器忽略窗口大小控制序列，可以手动放大窗口，或在启动前指定目标尺寸：
+
+```bash
+LIVOX_MID360_TERMINAL_SIZE=140x45 ./livox_mid360_diagnostics monitor
+```
+
+需要关闭自动调整时：
+
+```bash
+LIVOX_MID360_RESIZE_TERMINAL=0 ./livox_mid360_diagnostics
 ```
 
 需要请求雷达进入 normal mode 并开启点云/IMU 发送时，确认设备连接正确且物理状态健康后再运行：
@@ -144,7 +169,7 @@ source scripts/prepare_config.sh
 
 ```bash
 ssh user@host
-bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/main/scripts/use_cpp_release.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Jasonzzhu0514/Livox-MID360-Diagnostics/HEAD/scripts/use_cpp_release.sh)
 ./livox_mid360_diagnostics
 ```
 

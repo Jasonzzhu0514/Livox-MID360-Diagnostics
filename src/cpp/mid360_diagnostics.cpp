@@ -138,6 +138,7 @@ std::string choose_command_menu() {
     usage("livox_mid360_diagnostics");
     return "quit";
   }
+  neon::ensure_terminal_size();
 
   neon::RawTerminal raw_terminal;
   if (!raw_terminal.enter()) {

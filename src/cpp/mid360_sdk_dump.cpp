@@ -270,6 +270,7 @@ void enter_dump_tui() {
   if (!should_use_tui()) {
     return;
   }
+  neon::ensure_terminal_size();
   if (tcgetattr(STDIN_FILENO, &g_original_termios) == 0) {
     termios raw = g_original_termios;
     raw.c_lflag &= static_cast<unsigned>(~(ICANON | ECHO));
