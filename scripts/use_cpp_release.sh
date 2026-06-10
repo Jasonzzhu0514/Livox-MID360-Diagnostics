@@ -37,6 +37,13 @@ command -v tar >/dev/null 2>&1 || {
   _livox_mid360_release_fail "tar is required"
 }
 
+_livox_mid360_download() {
+  local url="$1"
+  local output="$2"
+
+  curl -fL --progress-bar "$url" -o "$output"
+}
+
 _livox_mid360_url="$(
   curl -fsSL "https://api.github.com/repos/$_livox_mid360_repo/releases/latest" |
     awk -F\" -v suffix="$_livox_mid360_suffix" '$2 == "browser_download_url" && $4 ~ suffix "$" { print $4; exit }'
@@ -57,7 +64,7 @@ if [[ -z "$_livox_mid360_url" ]]; then
   _livox_mid360_tmp_dir="$(mktemp -d)"
   _livox_mid360_pkg="$_livox_mid360_tmp_dir/${_livox_mid360_tar_url##*/}"
   echo "Downloading ${_livox_mid360_tar_url##*/}"
-  curl -fsSL "$_livox_mid360_tar_url" -o "$_livox_mid360_pkg" || {
+  _livox_mid360_download "$_livox_mid360_tar_url" "$_livox_mid360_pkg" || {
     rm -rf "$_livox_mid360_tmp_dir"
     _livox_mid360_release_fail "download failed: $_livox_mid360_tar_url"
   }
@@ -96,7 +103,7 @@ fi
 
 if [[ ! -x "$_livox_mid360_launcher_path" && -n "$_livox_mid360_url" ]]; then
   echo "Downloading ${_livox_mid360_url##*/} -> $_livox_mid360_launcher_path"
-  curl -fsSL "$_livox_mid360_url" -o "$_livox_mid360_launcher_path" || {
+  _livox_mid360_download "$_livox_mid360_url" "$_livox_mid360_launcher_path" || {
     _livox_mid360_release_fail "download failed: $_livox_mid360_url"
   }
   chmod +x "$_livox_mid360_launcher_path"
