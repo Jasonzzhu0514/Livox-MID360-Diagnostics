@@ -11,6 +11,7 @@
 - 修复 README 和部署文档中的 GitHub raw URL 写死 `main` 导致 Release 下载脚本 404 的问题。
 - 修复 monitor TUI 在窄窗口下 `NETWORK`、`DEVICE IDENTITY` 和 `STREAM STATUS` 面板内容越过边框的问题。
 - 修复已连接雷达但有线网卡没有 MID360 默认网段时，monitor 和 autoconfig 无法发现 `192.168.1.x` 雷达的问题。
+
 ## [1.2.0] - 2026-06-04
 ### 新增
 - 新增共享 TUI 输入、刷新节流和逐行差分渲染工具，菜单、autoconfig、monitor、dump 和 Python fallback 统一复用。
@@ -27,9 +28,7 @@
 - 修复 autoconfig 配置选择页快捷键提示重复、位置不固定以及长路径挤压候选列表的问题。
 
 ## [1.1.0] - 2026-06-01
-
 ### 新增
-
 - 提供单体 C++ 诊断入口，直接运行 `livox_mid360_diagnostics` 后可在菜单中选择 `autoconfig`、`monitor` 和 `dump`。
 - 优化交互式 TUI：扫描进度、错误提示、无雷达状态、时间刷新和 Ctrl+C 处理都保留在界面内。
 - 接入 tag 触发的 GitHub Release，CI 自动构建 Linux x86_64 和 aarch64 预编译二进制。
@@ -37,9 +36,7 @@
 - 移除仓库内提交的预编译产物，改为由 CI 生成和发布。
 
 ## [1.0.0] - 2026-05-27
-
 ### 新增
-
 - 整理仓库结构，将自有源码收敛到 src/cpp 和 src/python，并保留 external 作为上游 submodule 入口。
 - 增加 Python CLI，用于发现 MID360、选择并更新配置文件，以及被动查看 UDP 数据速率。
 - 增加 C++ CLI，用于发现 MID360、更新配置文件、查看 SDK 实时仪表盘，以及短时导出点云和 IMU CSV。
