@@ -1,5 +1,9 @@
 build/
 dist/*
+gui/dist/
+gui/node_modules/
+gui/src-tauri/target/
+gui/src-tauri/gen/
 *.tar.gz
 *.egg-info/
 __pycache__/

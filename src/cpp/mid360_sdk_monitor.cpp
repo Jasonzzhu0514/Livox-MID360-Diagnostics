@@ -72,11 +72,40 @@ struct Counters {
   NetEndpoint log_endpoint;
   std::string product_info;
   std::string firmware_version;
+  std::string loader_version;
   std::string hardware_version;
+  std::string mac;
   std::string control_status;
+  std::string status_code;
   int lidar_diag_status = -1;
   int core_temp = std::numeric_limits<int>::min();
   int environment_temp = std::numeric_limits<int>::min();
+  int pcl_data_type = -1;
+  int pattern_mode = -1;
+  int dual_emit_en = -1;
+  int frame_rate = -1;
+  int fov_cfg_en = -1;
+  int detect_mode = -1;
+  int work_mode_after_boot = -1;
+  int glass_heat = -1;
+  int fusa_en = -1;
+  int force_heat_en = -1;
+  int esc_mode = -1;
+  int pps_sync_mode = -1;
+  int lidar_flash_status = -1;
+  int fw_type = -1;
+  int cur_glass_heat_state = -1;
+  int roi_mode = -1;
+  uint32_t powerup_cnt = 0;
+  bool has_powerup_cnt = false;
+  uint32_t blind_spot_set = 0;
+  bool has_blind_spot_set = false;
+  uint64_t local_time_now = 0;
+  bool has_local_time_now = false;
+  uint64_t last_sync_time = 0;
+  bool has_last_sync_time = false;
+  int64_t time_offset = 0;
+  bool has_time_offset = false;
   int work_state = -1;
   int point_send_en = -1;
   int imu_data_en = -1;
@@ -518,6 +547,16 @@ bool json_int_value(const std::string& text, const std::string& key, int& value)
   return false;
 }
 
+bool json_int_value(const std::string& text, const std::string& key, int64_t& value) {
+  const std::regex pattern("\"" + key + "\"\\s*:\\s*(-?\\d+)");
+  std::smatch match;
+  if (std::regex_search(text, match, pattern)) {
+    value = std::stoll(match[1].str());
+    return true;
+  }
+  return false;
+}
+
 int json_int_value(const std::string& text, const std::string& key) {
   int value = -1;
   return json_int_value(text, key, value) ? value : -1;
@@ -650,6 +689,77 @@ std::string format_version_bytes(const uint8_t* data, size_t size) {
     out << static_cast<unsigned>(data[i]);
   }
   return out.str();
+}
+
+std::string format_mac_bytes(const uint8_t* data, size_t size) {
+  if (!data || size < 6) {
+    return "";
+  }
+  std::ostringstream out;
+  out << std::hex << std::uppercase << std::setfill('0');
+  for (size_t i = 0; i < 6; ++i) {
+    if (i > 0) {
+      out << ":";
+    }
+    out << std::setw(2) << static_cast<unsigned>(data[i]);
+  }
+  return out.str();
+}
+
+std::string format_mac_array(const std::vector<uint32_t>& values) {
+  if (values.size() < 6) {
+    return "";
+  }
+  std::ostringstream out;
+  out << std::hex << std::uppercase << std::setfill('0');
+  for (size_t i = 0; i < 6; ++i) {
+    if (i > 0) {
+      out << ":";
+    }
+    out << std::setw(2) << (values[i] & 0xff);
+  }
+  return out.str();
+}
+
+std::string format_status_bytes(const uint8_t* data, size_t size) {
+  if (!data || size == 0) {
+    return "";
+  }
+  const size_t count = std::min<size_t>(size, 32);
+  std::ostringstream out;
+  out << std::hex << std::uppercase << std::setfill('0');
+  bool wrote = false;
+  for (size_t i = 0; i < count; ++i) {
+    if (data[i] == 0) {
+      continue;
+    }
+    if (wrote) {
+      out << ",";
+    }
+    out << "0x" << std::setw(2) << static_cast<unsigned>(data[i]);
+    wrote = true;
+  }
+  return wrote ? out.str() : "0";
+}
+
+std::string format_status_array(const std::vector<uint32_t>& values) {
+  if (values.empty()) {
+    return "";
+  }
+  std::ostringstream out;
+  out << std::hex << std::uppercase << std::setfill('0');
+  bool wrote = false;
+  for (uint32_t value : values) {
+    if (value == 0) {
+      continue;
+    }
+    if (wrote) {
+      out << ",";
+    }
+    out << "0x" << std::setw(2) << (value & 0xff);
+    wrote = true;
+  }
+  return wrote ? out.str() : "0";
 }
 
 std::string format_hms_code(const uint32_t* data, size_t count) {
@@ -808,8 +918,41 @@ void parse_internal_kv(Counters& counters, const LivoxLidarKeyValueParam* kv) {
       target = value;
     }
   };
+  auto copy_uint32 = [&](uint32_t& target, bool& present) {
+    if (kv->length >= sizeof(uint32_t)) {
+      uint32_t value = 0;
+      std::memcpy(&value, kv->value, sizeof(value));
+      target = value;
+      present = true;
+    }
+  };
+  auto copy_uint64 = [&](uint64_t& target, bool& present) {
+    if (kv->length >= sizeof(uint64_t)) {
+      uint64_t value = 0;
+      std::memcpy(&value, kv->value, sizeof(value));
+      target = value;
+      present = true;
+    }
+  };
+  auto copy_int64 = [&](int64_t& target, bool& present) {
+    if (kv->length >= sizeof(int64_t)) {
+      int64_t value = 0;
+      std::memcpy(&value, kv->value, sizeof(value));
+      target = value;
+      present = true;
+    }
+  };
 
   switch (kv->key) {
+    case kKeyPclDataType:
+      copy_uint8(counters.pcl_data_type);
+      break;
+    case kKeyPatternMode:
+      copy_uint8(counters.pattern_mode);
+      break;
+    case kKeyDualEmitEn:
+      copy_uint8(counters.dual_emit_en);
+      break;
     case kKeySn:
       counters.sn.assign(reinterpret_cast<const char*>(kv->value), strnlen(reinterpret_cast<const char*>(kv->value), kv->length));
       break;
@@ -839,8 +982,14 @@ void parse_internal_kv(Counters& counters, const LivoxLidarKeyValueParam* kv) {
     case kKeyVersionApp:
       counters.firmware_version = format_version_bytes(kv->value, std::min<size_t>(kv->length, 4));
       break;
+    case kKeyVersionLoader:
+      counters.loader_version = format_version_bytes(kv->value, std::min<size_t>(kv->length, 4));
+      break;
     case kKeyVersionHardware:
       counters.hardware_version = format_version_bytes(kv->value, std::min<size_t>(kv->length, 4));
+      break;
+    case kKeyMac:
+      counters.mac = format_mac_bytes(kv->value, kv->length);
       break;
     case kKeyCurWorkState:
       copy_uint8(counters.work_state);
@@ -848,8 +997,41 @@ void parse_internal_kv(Counters& counters, const LivoxLidarKeyValueParam* kv) {
     case kKeyCoreTemp:
       copy_int32(counters.core_temp);
       break;
+    case kKeyPowerUpCnt:
+      copy_uint32(counters.powerup_cnt, counters.has_powerup_cnt);
+      break;
+    case kKeyLocalTimeNow:
+      copy_uint64(counters.local_time_now, counters.has_local_time_now);
+      break;
+    case kKeyLastSyncTime:
+      copy_uint64(counters.last_sync_time, counters.has_last_sync_time);
+      break;
+    case kKeyTimeOffset:
+      copy_int64(counters.time_offset, counters.has_time_offset);
+      break;
+    case kKeyStatusCode:
+      counters.status_code = format_status_bytes(kv->value, kv->length);
+      break;
     case kKeyEnvironmentTemp:
       copy_int32(counters.environment_temp);
+      break;
+    case kKeyBlindSpotSet:
+      copy_uint32(counters.blind_spot_set, counters.has_blind_spot_set);
+      break;
+    case kKeyFrameRate:
+      copy_uint8(counters.frame_rate);
+      break;
+    case kKeyFovCfgEn:
+      copy_uint8(counters.fov_cfg_en);
+      break;
+    case kKeyDetectMode:
+      copy_uint8(counters.detect_mode);
+      break;
+    case kKeyWorkModeAfterBoot:
+      copy_uint8(counters.work_mode_after_boot);
+      break;
+    case kKeyGlassHeat:
+      copy_uint8(counters.glass_heat);
       break;
     case kKeyPointSendEn:
       copy_uint8(counters.point_send_en);
@@ -857,11 +1039,29 @@ void parse_internal_kv(Counters& counters, const LivoxLidarKeyValueParam* kv) {
     case kKeyImuDataEn:
       copy_uint8(counters.imu_data_en);
       break;
+    case kKeyFusaEn:
+      copy_uint8(counters.fusa_en);
+      break;
+    case kKeyForceHeatEn:
+      copy_uint8(counters.force_heat_en);
+      break;
+    case kKeySetEscMode:
+      copy_uint8(counters.esc_mode);
+      break;
+    case kKeySetPpsSyncMode:
+      copy_uint8(counters.pps_sync_mode);
+      break;
     case kKeyTimeSyncType:
       copy_uint8(counters.time_sync_type);
       break;
     case kKeyLidarDiagStatus:
       copy_uint16(counters.lidar_diag_status);
+      break;
+    case kKeyLidarFlashStatus:
+      copy_uint8(counters.lidar_flash_status);
+      break;
+    case kKeyFwType:
+      copy_uint8(counters.fw_type);
       break;
     case kKeyHmsCode:
       if (kv->length >= sizeof(uint32_t)) {
@@ -870,6 +1070,12 @@ void parse_internal_kv(Counters& counters, const LivoxLidarKeyValueParam* kv) {
         std::memcpy(counters.hms_code, kv->value, count * sizeof(uint32_t));
         counters.has_hms_code = true;
       }
+      break;
+    case kKeyCurGlassHeatState:
+      copy_uint8(counters.cur_glass_heat_state);
+      break;
+    case kKeyRoiMode:
+      copy_uint8(counters.roi_mode);
       break;
     default:
       break;
@@ -1032,21 +1238,65 @@ void PushMsgCallback(const uint32_t handle, const uint8_t dev_type, const char* 
   int core_temp = std::numeric_limits<int>::min();
   int environment_temp = std::numeric_limits<int>::min();
   int work_state = -1;
+  int pcl_data_type = -1;
+  int pattern_mode = -1;
+  int dual_emit_en = -1;
+  int frame_rate = -1;
+  int fov_cfg_en = -1;
+  int detect_mode = -1;
+  int work_mode_after_boot = -1;
+  int glass_heat = -1;
   int point_send_en = -1;
   int imu_data_en = -1;
+  int fusa_en = -1;
+  int force_heat_en = -1;
+  int esc_mode = -1;
+  int pps_sync_mode = -1;
   int time_sync_type = -1;
+  int lidar_flash_status = -1;
+  int fw_type = -1;
+  int cur_glass_heat_state = -1;
+  int roi_mode = -1;
+  int powerup_cnt = -1;
+  int blind_spot_set = -1;
+  int64_t time_offset = 0;
   const bool has_diag = json_int_value(text, "lidar_diag_status", diag);
   const bool has_core_temp = json_int_value(text, "core_temp", core_temp);
   const bool has_environment_temp = json_int_value(text, "environment_temp", environment_temp);
   const bool has_work_state = json_int_value(text, "cur_work_state", work_state);
+  const bool has_pcl_data_type = json_int_value(text, "pcl_data_type", pcl_data_type);
+  const bool has_pattern_mode = json_int_value(text, "pattern_mode", pattern_mode);
+  const bool has_dual_emit = json_int_value(text, "dual_emit_en", dual_emit_en);
+  const bool has_frame_rate = json_int_value(text, "frame_rate", frame_rate);
+  const bool has_fov_cfg_en = json_int_value(text, "fov_cfg_en", fov_cfg_en);
+  const bool has_detect_mode = json_int_value(text, "detect_mode", detect_mode);
+  const bool has_work_mode_after_boot = json_int_value(text, "work_mode_after_boot", work_mode_after_boot);
+  const bool has_glass_heat = json_int_value(text, "glass_heat", glass_heat);
   const bool has_point_send = json_int_value(text, "point_send_en", point_send_en);
   const bool has_imu_data = json_int_value(text, "imu_data_en", imu_data_en);
+  const bool has_fusa = json_int_value(text, "fusa_en", fusa_en);
+  const bool has_force_heat = json_int_value(text, "force_heat_en", force_heat_en);
+  const bool has_esc_mode = json_int_value(text, "esc_mode", esc_mode);
+  const bool has_pps_sync = json_int_value(text, "pps_sync_mode", pps_sync_mode);
   const bool has_time_sync = json_int_value(text, "time_sync_type", time_sync_type);
+  const bool has_flash_status = json_int_value(text, "lidar_flash_status", lidar_flash_status);
+  const bool has_fw_type = json_int_value(text, "fw_type", fw_type);
+  const bool has_glass_heat_state = json_int_value(text, "cur_glass_heat_state", cur_glass_heat_state);
+  const bool has_roi_mode = json_int_value(text, "ROI_Mode", roi_mode) || json_int_value(text, "roi_mode", roi_mode);
+  const bool has_powerup_cnt = json_int_value(text, "powerup_cnt", powerup_cnt);
+  const bool has_blind_spot = json_int_value(text, "blind_spot_set", blind_spot_set);
+  const bool has_time_offset = json_int_value(text, "time_offset", time_offset);
   std::vector<uint32_t> firmware_values;
+  std::vector<uint32_t> loader_values;
   std::vector<uint32_t> hardware_values;
+  std::vector<uint32_t> mac_values;
+  std::vector<uint32_t> status_values;
   std::vector<uint32_t> hms_values;
   const bool has_firmware = json_int_array_value(text, "version_app", firmware_values);
+  const bool has_loader = json_int_array_value(text, "version_loader", loader_values);
   const bool has_hardware = json_int_array_value(text, "version_hardware", hardware_values);
+  const bool has_mac = json_int_array_value(text, "mac", mac_values);
+  const bool has_status_code = json_int_array_value(text, "status_code", status_values);
   const bool has_hms = json_int_array_value(text, "hms_code", hms_values);
   const bool has_lidar_ipcfg = !json_object_value(text, "lidar_ipcfg").empty();
   const bool has_state_endpoint = !json_object_value(text, "state_info_host_ipcfg").empty();
@@ -1079,20 +1329,92 @@ void PushMsgCallback(const uint32_t handle, const uint8_t dev_type, const char* 
     if (has_work_state) {
       g_counters.work_state = work_state;
     }
+    if (has_pcl_data_type) {
+      g_counters.pcl_data_type = pcl_data_type;
+    }
+    if (has_pattern_mode) {
+      g_counters.pattern_mode = pattern_mode;
+    }
+    if (has_dual_emit) {
+      g_counters.dual_emit_en = dual_emit_en;
+    }
+    if (has_frame_rate) {
+      g_counters.frame_rate = frame_rate;
+    }
+    if (has_fov_cfg_en) {
+      g_counters.fov_cfg_en = fov_cfg_en;
+    }
+    if (has_detect_mode) {
+      g_counters.detect_mode = detect_mode;
+    }
+    if (has_work_mode_after_boot) {
+      g_counters.work_mode_after_boot = work_mode_after_boot;
+    }
+    if (has_glass_heat) {
+      g_counters.glass_heat = glass_heat;
+    }
     if (has_point_send) {
       g_counters.point_send_en = point_send_en;
     }
     if (has_imu_data) {
       g_counters.imu_data_en = imu_data_en;
     }
+    if (has_fusa) {
+      g_counters.fusa_en = fusa_en;
+    }
+    if (has_force_heat) {
+      g_counters.force_heat_en = force_heat_en;
+    }
+    if (has_esc_mode) {
+      g_counters.esc_mode = esc_mode;
+    }
+    if (has_pps_sync) {
+      g_counters.pps_sync_mode = pps_sync_mode;
+    }
     if (has_time_sync) {
       g_counters.time_sync_type = time_sync_type;
+    }
+    if (has_flash_status) {
+      g_counters.lidar_flash_status = lidar_flash_status;
+    }
+    if (has_fw_type) {
+      g_counters.fw_type = fw_type;
+    }
+    if (has_glass_heat_state) {
+      g_counters.cur_glass_heat_state = cur_glass_heat_state;
+    }
+    if (has_roi_mode) {
+      g_counters.roi_mode = roi_mode;
+    }
+    if (has_powerup_cnt) {
+      g_counters.powerup_cnt = static_cast<uint32_t>(std::max(0, powerup_cnt));
+      g_counters.has_powerup_cnt = true;
+    }
+    if (has_blind_spot) {
+      g_counters.blind_spot_set = static_cast<uint32_t>(std::max(0, blind_spot_set));
+      g_counters.has_blind_spot_set = true;
+    }
+    if (has_time_offset) {
+      g_counters.time_offset = time_offset;
+      g_counters.has_time_offset = true;
     }
     if (has_firmware) {
       g_counters.firmware_version = format_version_array(firmware_values);
     }
+    if (has_loader) {
+      g_counters.loader_version = format_version_array(loader_values);
+    }
     if (has_hardware) {
       g_counters.hardware_version = format_version_array(hardware_values);
+    }
+    if (has_mac) {
+      const std::string mac = format_mac_array(mac_values);
+      if (!mac.empty()) {
+        g_counters.mac = mac;
+      }
+    }
+    if (has_status_code) {
+      g_counters.status_code = format_status_array(status_values);
     }
     if (has_hms) {
       std::memset(g_counters.hms_code, 0, sizeof(g_counters.hms_code));
@@ -1120,8 +1442,13 @@ void PushMsgCallback(const uint32_t handle, const uint8_t dev_type, const char* 
     if (has_log_endpoint) {
       parse_json_endpoint(text, "log_host_ipcfg", "dst_port", "src_port", g_counters.log_endpoint);
     }
-    if (has_core_temp || has_environment_temp || has_work_state || has_point_send ||
-        has_imu_data || has_time_sync || has_firmware || has_hardware || has_hms ||
+    if (has_core_temp || has_environment_temp || has_work_state || has_pcl_data_type ||
+        has_pattern_mode || has_dual_emit || has_frame_rate || has_fov_cfg_en ||
+        has_detect_mode || has_work_mode_after_boot || has_glass_heat || has_point_send ||
+        has_imu_data || has_fusa || has_force_heat || has_esc_mode || has_pps_sync ||
+        has_time_sync || has_flash_status || has_fw_type || has_glass_heat_state ||
+        has_roi_mode || has_powerup_cnt || has_blind_spot || has_time_offset ||
+        has_firmware || has_loader || has_hardware || has_mac || has_status_code || has_hms ||
         has_lidar_ipcfg || has_state_endpoint || has_point_endpoint || has_imu_endpoint ||
         has_ctl_endpoint || has_log_endpoint) {
       g_counters.internal_status = "push";
@@ -2449,11 +2776,40 @@ void reset_stream_counters_preserving_device() {
   preserved.log_endpoint = g_counters.log_endpoint;
   preserved.product_info = g_counters.product_info;
   preserved.firmware_version = g_counters.firmware_version;
+  preserved.loader_version = g_counters.loader_version;
   preserved.hardware_version = g_counters.hardware_version;
+  preserved.mac = g_counters.mac;
   preserved.control_status = "stream counters reset";
+  preserved.status_code = g_counters.status_code;
   preserved.lidar_diag_status = g_counters.lidar_diag_status;
   preserved.core_temp = g_counters.core_temp;
   preserved.environment_temp = g_counters.environment_temp;
+  preserved.pcl_data_type = g_counters.pcl_data_type;
+  preserved.pattern_mode = g_counters.pattern_mode;
+  preserved.dual_emit_en = g_counters.dual_emit_en;
+  preserved.frame_rate = g_counters.frame_rate;
+  preserved.fov_cfg_en = g_counters.fov_cfg_en;
+  preserved.detect_mode = g_counters.detect_mode;
+  preserved.work_mode_after_boot = g_counters.work_mode_after_boot;
+  preserved.glass_heat = g_counters.glass_heat;
+  preserved.fusa_en = g_counters.fusa_en;
+  preserved.force_heat_en = g_counters.force_heat_en;
+  preserved.esc_mode = g_counters.esc_mode;
+  preserved.pps_sync_mode = g_counters.pps_sync_mode;
+  preserved.lidar_flash_status = g_counters.lidar_flash_status;
+  preserved.fw_type = g_counters.fw_type;
+  preserved.cur_glass_heat_state = g_counters.cur_glass_heat_state;
+  preserved.roi_mode = g_counters.roi_mode;
+  preserved.powerup_cnt = g_counters.powerup_cnt;
+  preserved.has_powerup_cnt = g_counters.has_powerup_cnt;
+  preserved.blind_spot_set = g_counters.blind_spot_set;
+  preserved.has_blind_spot_set = g_counters.has_blind_spot_set;
+  preserved.local_time_now = g_counters.local_time_now;
+  preserved.has_local_time_now = g_counters.has_local_time_now;
+  preserved.last_sync_time = g_counters.last_sync_time;
+  preserved.has_last_sync_time = g_counters.has_last_sync_time;
+  preserved.time_offset = g_counters.time_offset;
+  preserved.has_time_offset = g_counters.has_time_offset;
   preserved.work_state = g_counters.work_state;
   preserved.point_send_en = g_counters.point_send_en;
   preserved.imu_data_en = g_counters.imu_data_en;
@@ -2926,21 +3282,53 @@ void print_line_report(
   const ReportValues values = make_report_values(delta, interval);
   std::cout << "elapsed=" << format_duration(elapsed)
             << " sn=" << (snapshot.sn.empty() ? "N/A" : snapshot.sn)
+            << " product=" << (snapshot.product_info.empty() ? "N/A" : snapshot.product_info)
+            << " handle=" << snapshot.handle
+            << " dev_type=" << static_cast<unsigned>(snapshot.dev_type)
             << " ip=" << (snapshot.lidar_ip.empty() ? "N/A" : snapshot.lidar_ip)
             << " mask=" << (snapshot.lidar_mask.empty() ? "N/A" : snapshot.lidar_mask)
             << " gateway=" << (snapshot.lidar_gateway.empty() ? "N/A" : snapshot.lidar_gateway)
+            << " net_state=" << endpoint_summary(snapshot.state_endpoint)
             << " net_point=" << endpoint_summary(snapshot.point_endpoint)
             << " net_imu=" << endpoint_summary(snapshot.imu_endpoint)
+            << " net_control=" << endpoint_summary(snapshot.ctl_endpoint)
+            << " net_log=" << endpoint_summary(snapshot.log_endpoint)
             << " link=" << connection_text(snapshot, now)
             << " health=" << health_text(snapshot.lidar_diag_status)
+            << " diag=" << snapshot.lidar_diag_status
             << " core_temp=" << temp_text(snapshot.core_temp)
             << " env_temp=" << temp_text(snapshot.environment_temp)
+            << " pcl_data_type=" << (snapshot.pcl_data_type < 0 ? "N/A" : data_type_name(static_cast<uint8_t>(snapshot.pcl_data_type)))
+            << " pattern=" << (snapshot.pattern_mode < 0 ? "N/A" : std::to_string(snapshot.pattern_mode))
+            << " dual_emit=" << on_off_text(snapshot.dual_emit_en)
+            << " frame_rate=" << (snapshot.frame_rate < 0 ? "N/A" : std::to_string(snapshot.frame_rate))
+            << " fov_enable=" << on_off_text(snapshot.fov_cfg_en)
+            << " detect_mode=" << (snapshot.detect_mode < 0 ? "N/A" : std::to_string(snapshot.detect_mode))
             << " work=" << work_state_text(snapshot.work_state)
+            << " boot_work=" << work_state_text(snapshot.work_mode_after_boot)
+            << " glass_heat=" << on_off_text(snapshot.glass_heat)
+            << " glass_heat_state=" << (snapshot.cur_glass_heat_state < 0 ? "N/A" : std::to_string(snapshot.cur_glass_heat_state))
             << " point_send=" << on_off_text(snapshot.point_send_en)
             << " imu_enable=" << on_off_text(snapshot.imu_data_en)
+            << " fusa=" << on_off_text(snapshot.fusa_en)
+            << " force_heat=" << on_off_text(snapshot.force_heat_en)
+            << " esc_mode=" << (snapshot.esc_mode < 0 ? "N/A" : std::to_string(snapshot.esc_mode))
+            << " pps_sync=" << (snapshot.pps_sync_mode < 0 ? "N/A" : std::to_string(snapshot.pps_sync_mode))
             << " time_sync=" << time_sync_type_text(snapshot.time_sync_type)
+            << " time_sync_raw=" << snapshot.time_sync_type
+            << " local_time=" << (snapshot.has_local_time_now ? std::to_string(snapshot.local_time_now) : "N/A")
+            << " last_sync=" << (snapshot.has_last_sync_time ? std::to_string(snapshot.last_sync_time) : "N/A")
+            << " time_offset=" << (snapshot.has_time_offset ? std::to_string(snapshot.time_offset) : "N/A")
             << " fw=" << firmware_text(snapshot)
+            << " loader=" << (snapshot.loader_version.empty() ? "N/A" : snapshot.loader_version)
             << " hw=" << (snapshot.hardware_version.empty() ? "N/A" : snapshot.hardware_version)
+            << " mac=" << (snapshot.mac.empty() ? "N/A" : snapshot.mac)
+            << " fw_type=" << (snapshot.fw_type < 0 ? "N/A" : std::to_string(snapshot.fw_type))
+            << " flash=" << (snapshot.lidar_flash_status < 0 ? "N/A" : std::to_string(snapshot.lidar_flash_status))
+            << " powerups=" << (snapshot.has_powerup_cnt ? std::to_string(snapshot.powerup_cnt) : "N/A")
+            << " blind_spot=" << (snapshot.has_blind_spot_set ? std::to_string(snapshot.blind_spot_set) : "N/A")
+            << " roi=" << (snapshot.roi_mode < 0 ? "N/A" : std::to_string(snapshot.roi_mode))
+            << " status_code=" << (snapshot.status_code.empty() ? "N/A" : snapshot.status_code)
             << " hms=" << (snapshot.has_hms_code ? format_hms_code(snapshot.hms_code, 8) : "N/A")
             << " info_src=" << (snapshot.internal_status.empty() ? "N/A" : snapshot.internal_status)
             << " info_age=" << internal_age_text(snapshot, now)
@@ -2949,6 +3337,7 @@ void print_line_report(
             << " point_mbps=" << fixed_number(values.point_mbps, 2)
             << " imu=" << format_rate(values.imu_samples_per_sec, "sample/s")
             << " type=" << data_type_name(snapshot.last_point_type)
+            << " frame=" << static_cast<unsigned>(snapshot.last_point_frame)
             << " udp=" << snapshot.last_point_udp
             << std::endl;
 }

@@ -1,0 +1,18 @@
+[package]
+name = "livox-mid360-diagnostics-gui"
+version = "2.0.0"
+description = "Tauri desktop demo for Livox MID360 Diagnostics"
+authors = ["Jasonzzhu0514"]
+edition = "2021"
+
+[lib]
+name = "livox_mid360_diagnostics_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "1", features = [] }
+libc = "0.2"

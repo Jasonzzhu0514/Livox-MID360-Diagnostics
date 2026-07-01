@@ -85,7 +85,9 @@ jobs:
   publish-release:
     name: 从版本标签发布 Release
     runs-on: ubuntu-24.04
-    needs: build-prebuilt
+    needs:
+      - build-prebuilt
+      - build-gui
     steps:
       - name: 检出仓库
         uses: actions/checkout@v6
@@ -114,7 +116,15 @@ jobs:
       - name: 下载预编译产物
         uses: actions/download-artifact@v8
         with:
+          pattern: prebuilt-*
           path: dist/prebuilt
+          merge-multiple: true
+
+      - name: 下载 GUI 产物
+        uses: actions/download-artifact@v8
+        with:
+          pattern: gui-*
+          path: dist/gui
           merge-multiple: true
 
       - name: 校验预编译附件
@@ -134,6 +144,25 @@ jobs:
           for asset in "${REQUIRED[@]}"; do
             if [[ ! -s "${asset}" ]]; then
               echo "Missing release asset: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+      - name: 校验 GUI 附件
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          REQUIRED=(
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-x86_64.AppImage"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-x86_64.deb"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-aarch64.AppImage"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-aarch64.deb"
+          )
+
+          for asset in "${REQUIRED[@]}"; do
+            if [[ ! -s "${asset}" ]]; then
+              echo "Missing GUI release asset: ${asset}" >&2
               exit 1
             fi
           done
@@ -186,7 +215,14 @@ jobs:
             "dist/prebuilt/livox_mid360_diagnostics-${VERSION}-linux-aarch64"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-x86_64.tar.gz"
             "dist/prebuilt/livox-mid360-diagnostics-cpp-${VERSION}-linux-aarch64.tar.gz"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-x86_64.AppImage"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-x86_64.deb"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-aarch64.AppImage"
+            "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-aarch64.deb"
           )
+
+          shopt -s nullglob
+          ASSETS+=(dist/gui/livox-mid360-diagnostics-gui-"${VERSION}"-linux-*.rpm)
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             echo "Release already exists for ${TAG}" >&2
@@ -194,3 +230,112 @@ jobs:
           fi
 
           gh release create "${TAG}" "${ASSETS[@]}" --title "${TITLE}" --notes-file release-notes.md
+
+  build-gui:
+    name: 构建 ${{ matrix.arch }} GUI 安装包
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:20.04
+    steps:
+      - name: 安装系统依赖
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            file \
+            g++ \
+            gcc \
+            git \
+            libappindicator3-dev \
+            libgtk-3-dev \
+            libncursesw5-dev \
+            librsvg2-dev \
+            libsoup2.4-dev \
+            libssl-dev \
+            libwebkit2gtk-4.0-dev \
+            make \
+            patchelf \
+            pkg-config \
+            python3 \
+            python3-pip \
+            rpm \
+            tar
+
+      - name: 检出仓库
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.0
+          run_install: false
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 构建并嵌入诊断二进制
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCH="${{ matrix.arch }}"
+          ./scripts/package_cpp_prebuilt.sh
+          mkdir -p gui/src-tauri/resources
+          cp "dist/prebuilt/livox_mid360_diagnostics-linux-${ARCH}" "gui/src-tauri/resources/livox_mid360_diagnostics-linux-${ARCH}"
+
+      - name: 构建 GUI 安装包
+        shell: bash
+        working-directory: gui
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm tauri build --bundles appimage,deb,rpm
+
+      - name: 整理 GUI 附件
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          ARCH="${{ matrix.arch }}"
+          mkdir -p dist/gui
+
+          appimage="$(find gui/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
+          deb="$(find gui/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)"
+          rpm="$(find gui/src-tauri/target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' | head -n 1 || true)"
+
+          test -s "${appimage}"
+          test -s "${deb}"
+
+          cp "${appimage}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.AppImage"
+          cp "${deb}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.deb"
+          if [[ -n "${rpm}" && -s "${rpm}" ]]; then
+            cp "${rpm}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.rpm"
+          fi
+
+      - name: 上传 GUI 产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: gui-${{ matrix.arch }}
+          path: dist/gui/*
+          if-no-files-found: error
+          retention-days: 7

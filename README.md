@@ -115,6 +115,20 @@ LIVOX_MID360_RESIZE_TERMINAL=0 ./livox_mid360_diagnostics
 
 需要图形化查看点云时，使用 `livox_ros_driver2` + RViz。`external/livox_ros_driver2` 只是源码 submodule，不等于已经构建好的 ROS 工作区。
 
+## GUI Demo
+
+仓库内提供早期 Tauri/React 桌面 demo，方向是 v2 跨平台 GUI。当前 demo 复用现有 C++ `livox_mid360_diagnostics` 二进制作为后端，提供 Diagnostics/Logs 双视图、持续监测、暂停/恢复/停止控制、设备基础信息和 SDK 只读详情展示。
+
+```bash
+cd gui
+pnpm install
+pnpm tauri dev
+```
+
+GUI demo 当前使用 Tauri 1.x，以兼容 Ubuntu 20.04 的 WebKitGTK 4.0 / libsoup2 桌面依赖；只预览界面时可以运行 `pnpm dev`。更多说明见 `docs/GUI.md`。
+
+从 v2.0.0 开始，GitHub Release 会随 tag 同时发布 GUI 安装包附件，包含 Linux x86_64/aarch64 AppImage、deb，以及构建可用时的 rpm。GUI 安装包内嵌同架构 `livox_mid360_diagnostics` 后端二进制；需要指定自定义后端时仍可设置 `LIVOX_MID360_DIAGNOSTICS_BIN`。
+
 ## Python CLI
 
 Python CLI 适合轻量配置和低层 UDP 端口检查。它不走 Livox-SDK2 callback，不向雷达发送 SDK 控制命令。

@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/1",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devPath": "http://127.0.0.1:1420",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Livox MID360 Diagnostics",
+    "version": "2.0.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.jasonzzhu0514.livox-mid360-diagnostics.gui",
+      "resources": [
+        "resources/*"
+      ],
+      "targets": "all"
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Livox MID360 Diagnostics",
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1180,
+        "minHeight": 760
+      }
+    ]
+  }
+}
