@@ -272,7 +272,9 @@ jobs:
             python3 \
             python3-pip \
             rpm \
-            tar
+            tar \
+            wget \
+            libfuse2
 
       - name: 检出仓库
         uses: actions/checkout@v6
@@ -306,6 +308,8 @@ jobs:
       - name: 构建 GUI 安装包
         shell: bash
         working-directory: gui
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
           set -euo pipefail
           pnpm install --frozen-lockfile
