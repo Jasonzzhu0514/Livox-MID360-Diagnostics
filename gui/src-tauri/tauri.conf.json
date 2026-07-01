@@ -17,6 +17,9 @@
     "bundle": {
       "active": true,
       "identifier": "com.jasonzzhu0514.livox-mid360-diagnostics.gui",
+      "icon": [
+        "icons/icon.png"
+      ],
       "resources": [
         "resources/*"
       ],

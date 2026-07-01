@@ -319,12 +319,22 @@ jobs:
           ARCH="${{ matrix.arch }}"
           mkdir -p dist/gui
 
-          appimage="$(find gui/src-tauri/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' | head -n 1)"
-          deb="$(find gui/src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | head -n 1)"
-          rpm="$(find gui/src-tauri/target/release/bundle/rpm -maxdepth 1 -type f -name '*.rpm' | head -n 1 || true)"
+          bundle_dir="gui/src-tauri/target/release/bundle"
+          echo "Available GUI bundle outputs:"
+          find "${bundle_dir}" -maxdepth 4 -type f -print | sort
 
-          test -s "${appimage}"
-          test -s "${deb}"
+          appimage="$(find "${bundle_dir}" -type f -name '*.AppImage' | head -n 1 || true)"
+          deb="$(find "${bundle_dir}" -type f -name '*.deb' | head -n 1 || true)"
+          rpm="$(find "${bundle_dir}" -type f -name '*.rpm' | head -n 1 || true)"
+
+          if [[ -z "${appimage}" || ! -s "${appimage}" ]]; then
+            echo "Missing GUI AppImage bundle" >&2
+            exit 1
+          fi
+          if [[ -z "${deb}" || ! -s "${deb}" ]]; then
+            echo "Missing GUI deb bundle" >&2
+            exit 1
+          fi
 
           cp "${appimage}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.AppImage"
           cp "${deb}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.deb"
