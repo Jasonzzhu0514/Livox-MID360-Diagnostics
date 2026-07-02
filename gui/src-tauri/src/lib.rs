@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -245,6 +246,16 @@ fn cli_version(path: &Path) -> Option<String> {
     }
 }
 
+fn format_spawn_error(binary: &Path, err: std::io::Error) -> String {
+    let mut message = format!("failed to start {}: {}", binary.display(), err);
+    if err.kind() == ErrorKind::NotFound && binary.is_file() {
+        message.push_str(
+            ". The binary file exists, so Linux likely could not find the ELF interpreter or a required shared library for it. Check that the AppImage architecture matches this machine and that libc/libstdc++/ncurses runtime libraries are installed, or set LIVOX_MID360_DIAGNOSTICS_BIN to a compatible diagnostics binary.",
+        );
+    }
+    message
+}
+
 fn push_common_args(args: &mut Vec<String>, options: &RunOptions) {
     if let Some(iface) = options.iface.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
         args.push("--iface".to_string());
@@ -332,7 +343,7 @@ fn run_cli(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| format!("failed to start {}: {}", binary.display(), err))?;
+        .map_err(|err| format_spawn_error(&binary, err))?;
     {
         let mut pid = control
             .pid

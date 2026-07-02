@@ -346,6 +346,22 @@ jobs:
             cp "${rpm}" "dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.rpm"
           fi
 
+      - name: 校验 AppImage 内嵌后端
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          ARCH="${{ matrix.arch }}"
+          APPIMAGE="dist/gui/livox-mid360-diagnostics-gui-${VERSION}-linux-${ARCH}.AppImage"
+          EXPECTED="squashfs-root/usr/lib/livox-mid360-diagnostics/resources/livox_mid360_diagnostics-linux-${ARCH}"
+
+          rm -rf squashfs-root
+          chmod +x "${APPIMAGE}"
+          "${APPIMAGE}" --appimage-extract >/dev/null
+          test -x "${EXPECTED}"
+          "${EXPECTED}" --version
+          rm -rf squashfs-root
+
       - name: 上传 GUI 产物
         uses: actions/upload-artifact@v7
         with:

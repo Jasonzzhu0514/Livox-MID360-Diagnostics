@@ -1,6 +1,6 @@
 [package]
 name = "livox-mid360-diagnostics-gui"
-version = "2.0.0"
+version = "2.0.1"
 description = "Tauri desktop demo for Livox MID360 Diagnostics"
 authors = ["Jasonzzhu0514"]
 edition = "2021"
