@@ -250,10 +250,18 @@ fn format_spawn_error(binary: &Path, err: std::io::Error) -> String {
     let mut message = format!("failed to start {}: {}", binary.display(), err);
     if err.kind() == ErrorKind::NotFound && binary.is_file() {
         message.push_str(
-            ". The binary file exists, so Linux likely could not find the ELF interpreter or a required shared library for it. Check that the AppImage architecture matches this machine and that libc/libstdc++/ncurses runtime libraries are installed, or set LIVOX_MID360_DIAGNOSTICS_BIN to a compatible diagnostics binary.",
+            ". The binary file exists, so Linux may have failed to find the process working directory, ELF interpreter, or a required shared library. Check that the AppImage architecture matches this machine and that libc/libstdc++/ncurses runtime libraries are installed, or set LIVOX_MID360_DIAGNOSTICS_BIN to a compatible diagnostics binary.",
         );
     }
     message
+}
+
+fn cli_working_dir() -> PathBuf {
+    let root = repo_root();
+    if root.is_dir() {
+        return root;
+    }
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn push_common_args(args: &mut Vec<String>, options: &RunOptions) {
@@ -337,7 +345,7 @@ fn run_cli(
     emit_output(&window, &run_id, "system", &format!("$ {} {}", binary.display(), args.join(" ")));
     let mut child = Command::new(&binary)
         .args(&args)
-        .current_dir(repo_root())
+        .current_dir(cli_working_dir())
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
