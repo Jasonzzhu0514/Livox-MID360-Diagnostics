@@ -1,6 +1,6 @@
 [package]
 name = "livox-mid360-diagnostics-gui"
-version = "2.0.2"
+version = "2.1.0"
 description = "Tauri desktop demo for Livox MID360 Diagnostics"
 authors = ["Jasonzzhu0514"]
 edition = "2021"
@@ -13,8 +13,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "1", features = [] }
 
 [dependencies]
+base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "1", features = [] }
+serde_json = "1"
+tauri = { version = "1", features = ["shell-open"] }
 libc = "0.2"
 
 [features]

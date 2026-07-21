@@ -59,24 +59,29 @@ if(LIVOX_SDK2_ROOT AND EXISTS "${LIVOX_SDK2_ROOT}/build/sdk_core/liblivox_lidar_
   set(LIVOX_SDK2_LIBRARY "${LIVOX_SDK2_ROOT}/build/sdk_core/liblivox_lidar_sdk_static.a")
   add_livox_sdk2_tool(mid360_sdk_monitor src/cpp/mid360_sdk_monitor.cpp "${LIVOX_SDK2_LIBRARY}")
   add_livox_sdk2_tool(mid360_sdk_dump src/cpp/mid360_sdk_dump.cpp "${LIVOX_SDK2_LIBRARY}")
+  add_livox_sdk2_tool(mid360_sdk_preview src/cpp/mid360_sdk_preview.cpp "${LIVOX_SDK2_LIBRARY}")
   add_livox_sdk2_tool_object(mid360_sdk_monitor_obj src/cpp/mid360_sdk_monitor.cpp run_mid360_sdk_monitor)
   add_livox_sdk2_tool_object(mid360_sdk_dump_obj src/cpp/mid360_sdk_dump.cpp run_mid360_sdk_dump)
+  add_livox_sdk2_tool_object(mid360_sdk_preview_obj src/cpp/mid360_sdk_preview.cpp run_mid360_sdk_preview)
 elseif(LIVOX_SDK2_ROOT AND EXISTS "${LIVOX_SDK2_ROOT}/build/sdk_core/liblivox_lidar_sdk_shared.so")
   set(LIVOX_SDK2_LIBRARY "${LIVOX_SDK2_ROOT}/build/sdk_core/liblivox_lidar_sdk_shared.so")
   add_livox_sdk2_tool(mid360_sdk_monitor src/cpp/mid360_sdk_monitor.cpp "${LIVOX_SDK2_LIBRARY}")
   add_livox_sdk2_tool(mid360_sdk_dump src/cpp/mid360_sdk_dump.cpp "${LIVOX_SDK2_LIBRARY}")
+  add_livox_sdk2_tool(mid360_sdk_preview src/cpp/mid360_sdk_preview.cpp "${LIVOX_SDK2_LIBRARY}")
   add_livox_sdk2_tool_object(mid360_sdk_monitor_obj src/cpp/mid360_sdk_monitor.cpp run_mid360_sdk_monitor)
   add_livox_sdk2_tool_object(mid360_sdk_dump_obj src/cpp/mid360_sdk_dump.cpp run_mid360_sdk_dump)
+  add_livox_sdk2_tool_object(mid360_sdk_preview_obj src/cpp/mid360_sdk_preview.cpp run_mid360_sdk_preview)
 elseif(LIVOX_SDK2_ROOT)
   message(STATUS "Livox-SDK2 found at ${LIVOX_SDK2_ROOT}, but its library is not built; run scripts/build_cpp_with_sdk2.sh to build SDK tools.")
 else()
   message(STATUS "LIVOX_SDK2_ROOT not set; SDK tools will not be built.")
 endif()
 
-if(TARGET mid360_sdk_monitor_obj AND TARGET mid360_sdk_dump_obj)
+if(TARGET mid360_sdk_monitor_obj AND TARGET mid360_sdk_dump_obj AND TARGET mid360_sdk_preview_obj)
   target_sources(livox_mid360_diagnostics PRIVATE
     $<TARGET_OBJECTS:mid360_sdk_monitor_obj>
     $<TARGET_OBJECTS:mid360_sdk_dump_obj>
+    $<TARGET_OBJECTS:mid360_sdk_preview_obj>
   )
   target_include_directories(livox_mid360_diagnostics PRIVATE "${LIVOX_SDK2_ROOT}/include")
   target_link_libraries(livox_mid360_diagnostics PRIVATE

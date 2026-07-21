@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +29,13 @@ struct Ipv4Info {
 struct LinkInfo {
   std::string name;
   bool lower_up = false;
+};
+
+struct DiscoveryCandidate {
+  std::string name;
+  std::string ip;
+  int prefix = 0;
+  bool auto_bind_livox_subnet = false;
 };
 
 inline bool ethernet_like_name(const std::string& name) {
@@ -199,6 +207,115 @@ inline std::string choose_livox_host_ip(const std::string& preferred = "192.168.
     }
   }
   return preferred;
+}
+
+inline DiscoveryCandidate auto_bind_livox_candidate(
+    const std::string& iface,
+    const std::string& preferred_ip = "192.168.1.5") {
+  return {iface, choose_livox_host_ip(preferred_ip), 24, true};
+}
+
+inline std::vector<DiscoveryCandidate> auto_bind_livox_candidates(
+    const std::string& preferred_ip = "192.168.1.5") {
+  std::vector<DiscoveryCandidate> candidates;
+  for (const auto& link : sorted_candidate_links()) {
+    if (!ethernet_like_name(link.name) || iface_has_livox_subnet_ip(link.name)) {
+      continue;
+    }
+    candidates.push_back(auto_bind_livox_candidate(link.name, preferred_ip));
+  }
+  return candidates;
+}
+
+inline void sort_sdk_discovery_candidates(std::vector<DiscoveryCandidate>& candidates) {
+  std::stable_sort(candidates.begin(), candidates.end(), [](const DiscoveryCandidate& a, const DiscoveryCandidate& b) {
+    const auto score = [](const DiscoveryCandidate& item) {
+      int value = 0;
+      if (ethernet_like_name(item.name)) {
+        value += 20;
+      }
+      if (livox_subnet_ip(item.ip)) {
+        value += 50;
+      }
+      return value;
+    };
+    const int as = score(a);
+    const int bs = score(b);
+    if (as != bs) {
+      return as > bs;
+    }
+    return a.name < b.name;
+  });
+}
+
+inline std::vector<DiscoveryCandidate> sdk_discovery_candidates(
+    const std::string& requested_iface,
+    const std::string& host_ip,
+    bool auto_bind_livox_subnet,
+    const std::string& auto_bind_ip) {
+  if (!host_ip.empty()) {
+    if (!valid_ipv4(host_ip)) {
+      throw std::runtime_error("invalid --host-ip: " + host_ip);
+    }
+    for (const auto& iface : list_ipv4_interfaces()) {
+      if (iface.ip == host_ip) {
+        return {{iface.name, iface.ip, iface.prefix, false}};
+      }
+    }
+    return {{"manual", host_ip, 32, false}};
+  }
+
+  const std::vector<Ipv4Info> interfaces = list_ipv4_interfaces();
+  if (requested_iface != "auto") {
+    std::vector<DiscoveryCandidate> candidates;
+    if (!iface_has_livox_subnet_ip(requested_iface) && auto_bind_livox_subnet) {
+      candidates.push_back(auto_bind_livox_candidate(requested_iface, auto_bind_ip));
+    }
+    for (const auto& iface : interfaces) {
+      if (iface.name == requested_iface) {
+        candidates.push_back({iface.name, iface.ip, iface.prefix, false});
+      }
+    }
+    if (candidates.empty()) {
+      throw std::runtime_error(
+          "interface has no usable IPv4 address: " + requested_iface +
+          "; run with sudo or manually add " + auto_bind_ip + "/24");
+    }
+    return candidates;
+  }
+
+  std::vector<DiscoveryCandidate> livox_candidates;
+  std::vector<DiscoveryCandidate> other_candidates;
+  for (const auto& iface : interfaces) {
+    DiscoveryCandidate candidate{iface.name, iface.ip, iface.prefix, false};
+    if (livox_subnet_ip(iface.ip)) {
+      livox_candidates.push_back(candidate);
+    } else {
+      other_candidates.push_back(candidate);
+    }
+  }
+  sort_sdk_discovery_candidates(livox_candidates);
+  sort_sdk_discovery_candidates(other_candidates);
+
+  std::vector<DiscoveryCandidate> candidates;
+  candidates.insert(candidates.end(), livox_candidates.begin(), livox_candidates.end());
+  if (auto_bind_livox_subnet && livox_candidates.empty()) {
+    const std::vector<DiscoveryCandidate> auto_bind_candidates = auto_bind_livox_candidates(auto_bind_ip);
+    candidates.insert(candidates.end(), auto_bind_candidates.begin(), auto_bind_candidates.end());
+  }
+  candidates.insert(candidates.end(), other_candidates.begin(), other_candidates.end());
+  return candidates;
+}
+
+inline std::string describe_discovery_candidate(const DiscoveryCandidate& candidate) {
+  if (candidate.name.empty() || candidate.name == "manual") {
+    return candidate.ip;
+  }
+  std::string description = candidate.name + " (" + candidate.ip + "/" + std::to_string(candidate.prefix) + ")";
+  if (candidate.auto_bind_livox_subnet) {
+    description += " auto-bind";
+  }
+  return description;
 }
 
 inline int run_command(const std::vector<std::string>& args) {

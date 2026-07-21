@@ -1,6 +1,6 @@
 {
   "name": "livox-mid360-diagnostics-gui",
-  "version": "2.0.2",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.33.0",
@@ -14,12 +14,14 @@
     "@tauri-apps/api": "^1.6.0",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "three": "^0.160.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^1.6.3",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "@types/three": "^0.160.0",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"

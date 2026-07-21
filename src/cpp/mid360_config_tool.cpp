@@ -98,12 +98,7 @@ struct DetectionSummary {
   Discovery result;
 };
 
-struct InterfaceCandidate {
-  std::string name;
-  std::string ip;
-  int prefix = 0;
-  bool auto_bind_livox_subnet = false;
-};
+using InterfaceCandidate = mid360_net::DiscoveryCandidate;
 
 std::vector<std::string> detection_rows(const DetectionSummary& summary);
 std::string detection_value(const std::string& value);
@@ -1135,7 +1130,7 @@ std::vector<InterfaceCandidate> candidate_ifaces(const Options& options, const s
       return item.name == options.iface;
     });
     if (!mid360_net::iface_has_livox_subnet_ip(options.iface) && options.auto_bind_livox_subnet) {
-      candidates.push_back({options.iface, mid360_net::choose_livox_host_ip(options.auto_bind_ip), 24, true});
+      candidates.push_back(mid360_net::auto_bind_livox_candidate(options.iface, options.auto_bind_ip));
     }
     if (found != interfaces.end()) {
       candidates.push_back({found->name, found->ip, found->prefix, false});
@@ -1181,14 +1176,11 @@ std::vector<InterfaceCandidate> candidate_ifaces(const Options& options, const s
       std::none_of(interfaces.begin(), interfaces.end(), [](const InterfaceInfo& item) {
         return mid360_net::livox_subnet_ip(item.ip);
       })) {
-    const std::string host_ip = mid360_net::choose_livox_host_ip(options.auto_bind_ip);
-    for (const auto& link : mid360_net::sorted_candidate_links()) {
-      if (!mid360_net::ethernet_like_name(link.name) ||
-          mid360_net::iface_has_livox_subnet_ip(link.name) ||
-          has_candidate(link.name)) {
+    for (const auto& candidate : mid360_net::auto_bind_livox_candidates(options.auto_bind_ip)) {
+      if (has_candidate(candidate.name)) {
         continue;
       }
-      candidates.push_back({link.name, host_ip, 24, true});
+      candidates.push_back(candidate);
     }
   }
   for (const auto& iface : interfaces) {

@@ -21,6 +21,7 @@ int run_mid360_config_tool(int argc, char** argv);
 #ifdef LIVOX_MID360_HAS_SDK_TOOLS
 int run_mid360_sdk_monitor(int argc, char** argv);
 int run_mid360_sdk_dump(int argc, char** argv);
+int run_mid360_sdk_preview(int argc, char** argv);
 #endif
 
 namespace {
@@ -35,7 +36,7 @@ struct MenuItem {
 
 void usage(const char* argv0) {
   std::cout
-      << "usage: " << argv0 << " [autoconfig|monitor|dump] [args...]\n"
+      << "usage: " << argv0 << " [autoconfig|monitor|preview|dump] [args...]\n"
       << "\n"
       << "C++ entry point for Livox MID360 diagnostics.\n"
       << "For dump, LIVOX_MID360_CONFIG is added automatically when set.\n"
@@ -45,6 +46,7 @@ void usage(const char* argv0) {
       << "commands:\n"
       << "  autoconfig   discover lidar IP/SN and optionally update MID360_config.json\n"
       << "  monitor      show Livox-SDK2 point cloud and IMU callback rates\n"
+      << "  preview      stream binary point cloud frames for the GUI preview\n"
       << "  dump         decode Livox-SDK2 callbacks to point/IMU CSV files\n";
 }
 
@@ -60,7 +62,7 @@ std::vector<std::string> menu_identity_rows() {
   };
 }
 
-std::vector<std::string> menu_command_rows(const std::array<MenuItem, 4>& items, size_t cursor, int width) {
+std::vector<std::string> menu_command_rows(const std::array<MenuItem, 5>& items, size_t cursor, int width) {
   std::vector<std::string> rows;
   rows.push_back("上下方向键移动，回车确认，q 或 Esc 退出。");
   rows.push_back("");
@@ -76,7 +78,7 @@ std::vector<std::string> menu_command_rows(const std::array<MenuItem, 4>& items,
   return rows;
 }
 
-std::string render_menu(const std::array<MenuItem, 4>& items, size_t cursor) {
+std::string render_menu(const std::array<MenuItem, 5>& items, size_t cursor) {
   const neon::Size term = neon::terminal_size();
   const int width = std::max(20, term.cols - 1);
   int used_rows = 0;
@@ -128,9 +130,10 @@ std::string render_menu(const std::array<MenuItem, 4>& items, size_t cursor) {
 }
 
 std::string choose_command_menu() {
-  const std::array<MenuItem, 4> items = {{
+  const std::array<MenuItem, 5> items = {{
       {"autoconfig", "发现雷达并选择要更新的配置文件", "CONFIG"},
       {"monitor", "发现雷达并查看实时 SDK 回调状态", "LIVE"},
+      {"preview", "为 GUI 点云画布输出实时点云帧", "3D"},
       {"dump", "短时采样并导出点云/IMU CSV", "CSV"},
       {"quit", "退出诊断入口", "EXIT"},
   }};
@@ -259,6 +262,7 @@ bool command_needs_config(const std::string& command) {
 bool known_command(const std::string& command) {
   return command == "autoconfig" || command == "config" ||
       command == "monitor" || command == "sdk-monitor" ||
+      command == "preview" || command == "sdk-preview" ||
       command == "dump" || command == "sdk-dump";
 }
 
@@ -271,6 +275,9 @@ std::string child_argv0(const std::string& command) {
   }
   if (command == "dump" || command == "sdk-dump") {
     return "mid360_sdk_dump";
+  }
+  if (command == "preview" || command == "sdk-preview") {
+    return "mid360_sdk_preview";
   }
   return command;
 }
@@ -286,8 +293,12 @@ int run_command(const std::string& command, int argc, std::vector<char*>& raw_ar
   if (command == "dump" || command == "sdk-dump") {
     return run_mid360_sdk_dump(argc, raw_args.data());
   }
+  if (command == "preview" || command == "sdk-preview") {
+    return run_mid360_sdk_preview(argc, raw_args.data());
+  }
 #else
-  if (command == "monitor" || command == "sdk-monitor" || command == "dump" || command == "sdk-dump") {
+  if (command == "monitor" || command == "sdk-monitor" || command == "dump" || command == "sdk-dump" ||
+      command == "preview" || command == "sdk-preview") {
     std::cerr << "ERROR: SDK command is unavailable; rebuild with Livox-SDK2.\n";
     return 2;
   }

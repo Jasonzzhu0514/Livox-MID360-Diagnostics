@@ -4,18 +4,32 @@ import {
   Activity,
   Cable,
   CheckCircle2,
+  ChevronDown,
   CircleAlert,
   Gauge,
+  Info,
   Loader2,
   Pause,
   Play,
+  ScanLine,
   Radar,
   RefreshCw,
   Settings2,
   Square,
   TerminalSquare,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import packageMetadata from "../package.json";
+import { AboutDialog } from "./AboutDialog";
+import { ErrorBoundary } from "./ErrorBoundary";
+import type { PreviewNotice, PreviewState } from "./preview-types";
+import { isTauriRuntime, tauriRequiredMessage } from "./runtime";
+
+const APP_VERSION = `v${packageMetadata.version}`;
+
+const PointCloudPreview = lazy(() =>
+  import("./PointCloudPreview").then((module) => ({ default: module.PointCloudPreview })),
+);
 
 type CliInfo = {
   path: string | null;
@@ -27,8 +41,19 @@ type CliInfo = {
 type RunOptions = {
   iface?: string;
   timeoutSec?: number;
-  noAutoBind?: boolean;
-  autoBindIp?: string;
+};
+
+type LidarNetworkState = "ready" | "needsSetup" | "noLink" | "unavailable";
+
+type LidarNetworkStatus = {
+  state: LidarNetworkState;
+  interfaces: string[];
+  iface: string | null;
+  ip: string | null;
+  prefix: number | null;
+  proposedIp: string | null;
+  temporary: boolean;
+  detail: string;
 };
 
 type CommandResult = {
@@ -40,14 +65,14 @@ type CommandResult = {
   summary: Record<string, string>;
 };
 
-type PanelMode = "diagnostics" | "logs";
-type DiagnosticsView = "overview" | "details";
-type RunKind = "monitor";
+type PanelMode = "diagnostics" | "pointcloud" | "logs";
+type RunKind = "monitor" | "preview";
 
 type OutputEvent = {
   runId: string;
   stream: "stdout" | "stderr" | "system";
   line: string;
+  summary?: Record<string, string>;
 };
 
 type CompleteEvent = {
@@ -65,12 +90,9 @@ const EMPTY_RESULT: CommandResult = {
   summary: {},
 };
 
-function isTauriRuntime() {
-  return typeof window.__TAURI_IPC__ === "function";
-}
-
-function tauriRequiredMessage() {
-  return "This action requires the Tauri desktop window. Browser preview at http://127.0.0.1:1420 only renders the UI.";
+function compactVersion(version: string | null | undefined) {
+  const match = version?.match(/\b(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)\b/);
+  return match ? `v${match[1]}` : "Version unavailable";
 }
 
 function textValue(value: string | undefined, fallback = "unavailable") {
@@ -78,24 +100,144 @@ function textValue(value: string | undefined, fallback = "unavailable") {
   return normalized && normalized.toUpperCase() !== "N/A" ? normalized : fallback;
 }
 
-function hasDisplayValue(value: string | undefined) {
+function compactFieldValue(value: string | undefined) {
   const normalized = value?.trim();
-  if (!normalized) return false;
+  if (!normalized) return value;
   const lowered = normalized.toLowerCase();
-  return ![
-    "n/a",
-    "unavailable",
-    "undefined",
-    "null",
-    "-1",
-    "unknown(-1)",
-    "sdk2 link",
-  ].includes(lowered);
+  if (lowered.includes("no mid360 lidar found")) return "Not found";
+  if (lowered.includes("stopped by user")) return "Stopped";
+  return value;
 }
 
 function modeLabel(mode: PanelMode | RunKind) {
   if (mode === "diagnostics" || mode === "monitor") return "Diagnostics";
+  if (mode === "pointcloud" || mode === "preview") return "PointCloud Preview";
   return "Logs";
+}
+
+function previewStateFromLine(line: string): PreviewState | null {
+  const normalized = line.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized.startsWith("error:")) return "error";
+  if (normalized.includes("preview stopped by user") || normalized.includes("preview process stopped by user")) {
+    return "stopping";
+  }
+  if (normalized.includes("preview: discovery candidates") || normalized.includes("preview: listening on")) {
+    return "discovering";
+  }
+  if (normalized.includes("preview: found lidar") || normalized.includes("preview: config=")) {
+    return "configuring";
+  }
+  if (normalized.includes("preview: streaming point cloud frames")) {
+    return "waiting_data";
+  }
+  if (normalized.includes("preview: stopped")) {
+    return "stopped";
+  }
+  return null;
+}
+
+function previewNoticeFromLine(line: string): PreviewNotice {
+  const trimmed = line.trim();
+  const normalized = trimmed.toLowerCase();
+  if (!normalized) return null;
+
+  const listening = trimmed.match(/^preview:\s+listening on\s+(.+?)\s+for\s+[\d.]+s/i);
+  if (listening) {
+    return {
+      tone: "info",
+      title: "Scanning for MID360",
+      detail: `Listening on ${listening[1]}.`,
+      hint: "Keep the sensor powered on and connected by Ethernet while discovery is running.",
+    };
+  }
+
+  if (normalized.startsWith("preview: discovery candidates")) {
+    return {
+      tone: "info",
+      title: "Scanning network interfaces",
+      detail: trimmed.replace(/^preview:\s*/i, ""),
+      hint: "If the expected Ethernet adapter is missing, select the interface manually in Diagnostics settings.",
+    };
+  }
+
+  const bindFailure = trimmed.match(/^preview:\s+warn\s+failed to add\s+(.+?)\s+to\s+(.+?);\s+run:\s+(.+)$/i);
+  if (bindFailure) {
+    return {
+      tone: "warning",
+      title: "Auto-bind needs permission",
+      detail: `Could not add ${bindFailure[1]} to ${bindFailure[2]}. Discovery will continue, but this interface may not see the lidar.`,
+      hint: bindFailure[3],
+    };
+  }
+
+  if (normalized.includes("preview: found lidar")) {
+    return {
+      tone: "info",
+      title: "MID360 found",
+      detail: trimmed.replace(/^preview:\s*/i, ""),
+      hint: "Configuring point transmission.",
+    };
+  }
+
+  if (normalized.includes("preview: streaming point cloud frames")) {
+    return {
+      tone: "info",
+      title: "Waiting for point data",
+      detail: "The lidar is configured and the preview is waiting for the first point frame.",
+    };
+  }
+
+  if (normalized.includes("no mid360 lidar found by sdk discovery")) {
+    return {
+      tone: "error",
+      title: "No MID360 lidar found",
+      detail: "SDK discovery finished without receiving a MID360 broadcast.",
+      hint: "Check sensor power, Ethernet link, host IP/subnet, firewall rules, and whether the selected interface is the lidar adapter.",
+    };
+  }
+
+  if (normalized.includes("livoxlidarsdkinit failed")) {
+    return {
+      tone: "error",
+      title: "Livox SDK failed to start",
+      detail: trimmed.replace(/^error:\s*/i, ""),
+      hint: "Close other Livox tools that may be using the SDK ports, then start preview again.",
+    };
+  }
+
+  if (normalized.startsWith("error:")) {
+    return {
+      tone: "error",
+      title: "Preview failed",
+      detail: trimmed.replace(/^error:\s*/i, ""),
+      hint: "Open Logs for the full backend output.",
+    };
+  }
+
+  return null;
+}
+
+function previewNoticeFromError(error: string): PreviewNotice {
+  const detail = error.trim();
+  if (!detail) return null;
+  return {
+    tone: "error",
+    title: "Preview failed",
+    detail,
+    hint: "Open Logs for the full backend output.",
+  };
+}
+
+function nextPreviewNotice(current: PreviewNotice, incoming: PreviewNotice): PreviewNotice {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  if (incoming.tone === "error") return incoming;
+  if (incoming.tone === "warning" && current.tone === "info") return incoming;
+  if (incoming.tone === "info" && current.tone === "warning") {
+    return incoming.title === "MID360 found" || incoming.title === "Waiting for point data" ? incoming : current;
+  }
+  return incoming;
 }
 
 function isStoppedResult(result: CommandResult | null) {
@@ -115,137 +257,32 @@ function deviceModel(devType: string | undefined, product: string | undefined) {
   return productField(product, "DevType");
 }
 
-const SUMMARY_KEYS = [
-  "elapsed",
-  "sn",
-  "product",
-  "handle",
-  "dev_type",
-  "ip",
-  "mask",
-  "gateway",
-  "net_state",
-  "net_point",
-  "net_imu",
-  "net_control",
-  "net_log",
-  "link",
-  "health",
-  "diag",
-  "core_temp",
-  "env_temp",
-  "pcl_data_type",
-  "pattern",
-  "dual_emit",
-  "frame_rate",
-  "fov_enable",
-  "detect_mode",
-  "work",
-  "boot_work",
-  "glass_heat",
-  "glass_heat_state",
-  "point_send",
-  "imu_enable",
-  "fusa",
-  "force_heat",
-  "esc_mode",
-  "pps_sync",
-  "time_sync",
-  "time_sync_raw",
-  "local_time",
-  "last_sync",
-  "time_offset",
-  "fw",
-  "loader",
-  "hw",
-  "mac",
-  "fw_type",
-  "flash",
-  "powerups",
-  "blind_spot",
-  "roi",
-  "status_code",
-  "hms",
-  "info_src",
-  "info_age",
-  "points",
-  "point_packets",
-  "point_mbps",
-  "imu",
-  "type",
-  "frame",
-  "udp",
-] as const;
-
-function parseSummaryFromLine(line: string) {
-  const summary: Record<string, string> = {};
-
-  const colonMatch = line.match(/^\s*([A-Za-z_-]+)\s*:\s*(.+)\s*$/);
-  if (colonMatch) {
-    const key = colonMatch[1].trim().toLowerCase().replace(/-/g, "_");
-    if (["iface", "iface_ip", "lidar_ip", "broadcast_code", "arp_host_ip", "discovery_pkts", "detect_method"].includes(key)) {
-      summary[key] = colonMatch[2].trim();
-    }
-  }
-
-  const positions = SUMMARY_KEYS
-    .map((key) => {
-      const match = new RegExp(`(?:^|\\s)${key}=`).exec(line);
-      if (!match || match.index < 0) {
-        return { key, index: -1, valueStart: -1 };
-      }
-      const prefixOffset = match[0].startsWith(" ") ? 1 : 0;
-      const index = match.index + prefixOffset;
-      return { key, index, valueStart: index + key.length + 1 };
-    })
-    .filter((item) => item.index >= 0)
-    .sort((left, right) => left.index - right.index);
-
-  for (let idx = 0; idx < positions.length; idx += 1) {
-    const { key, valueStart } = positions[idx];
-    const valueEnd = positions[idx + 1]?.index ?? line.length;
-    const value = line.slice(valueStart, valueEnd).trim();
-    if (value) {
-      summary[key] = value;
-    }
-  }
-
-  const discoveryPrefix = "discovery: Livox-SDK2 scan candidates: ";
-  if (line.startsWith(discoveryPrefix)) {
-    const rest = line.slice(discoveryPrefix.length);
-    const ifaceMatch = rest.match(/^(\S+)\s+\(([^/)]+)/);
-    if (ifaceMatch) {
-      summary.iface = summary.iface ?? ifaceMatch[1];
-      summary.iface_ip = summary.iface_ip ?? ifaceMatch[2];
-    }
-  }
-
-  const error = line.match(/^ERROR:\s*(.+)$/);
-  if (error) {
-    summary.status = error[1].trim();
-  }
-
-  return summary;
-}
-
 function statusTone(result: CommandResult | null) {
   if (!result) return "idle";
   if (isStoppedResult(result)) return "idle";
   return result.ok ? "ok" : "warn";
 }
 
+function runKindForMode(mode: PanelMode): RunKind | null {
+  if (mode === "diagnostics") return "monitor";
+  if (mode === "pointcloud") return "preview";
+  return null;
+}
+
 function statusText(mode: PanelMode, result: CommandResult | null, busy: RunKind | null, paused: boolean) {
+  const activeBusy = mode === "logs" ? busy : busy === runKindForMode(mode) ? busy : null;
+  const activePaused = mode === "logs" ? paused : paused && activeBusy !== null;
   if (mode === "logs") {
-    if (paused) return `${modeLabel(busy ?? "monitor")} is paused`;
-    if (busy) return `${modeLabel(busy)} is running`;
+    if (activePaused) return `${modeLabel(activeBusy ?? "monitor")} is paused`;
+    if (activeBusy) return `${modeLabel(activeBusy)} is running`;
     if (!result) return "No command has run yet";
     if (isStoppedResult(result)) return "Latest command was stopped";
     return result.ok ? "Latest command completed successfully" : result.summary.status ?? "Latest command needs attention";
   }
-  if (paused) {
+  if (activePaused) {
     return `${modeLabel(mode)} is paused`;
   }
-  if (busy) {
+  if (activeBusy) {
     return `${modeLabel(mode)} is running`;
   }
   if (!result) {
@@ -271,54 +308,30 @@ function StatusBanner({
   busy: RunKind | null;
   paused: boolean;
 }) {
-  const running = mode !== "logs" && busy !== null;
-  const tone = paused ? "paused" : running ? "running" : statusTone(result);
-  const label = paused ? "Paused" : running ? "Running" : isStoppedResult(result) ? "Stopped" : result ? (result.ok ? "Passed" : "Failed") : "Waiting";
+  const activeBusy = mode === "logs" ? busy : busy === runKindForMode(mode) ? busy : null;
+  const activePaused = mode === "logs" ? paused : paused && activeBusy !== null;
+  const running = activeBusy !== null;
+  const tone = activePaused ? "paused" : running ? "running" : statusTone(result);
+  const label = activePaused ? "Paused" : running ? "Running" : isStoppedResult(result) ? "Stopped" : result ? (result.ok ? "Passed" : "Failed") : "Waiting";
   return (
     <section className={`status-banner ${tone}`}>
       <div className="status-title">
         {tone === "ok" ? <CheckCircle2 size={20} /> : tone === "warn" ? <CircleAlert size={20} /> : <Settings2 size={20} />}
         <span>{label}</span>
       </div>
-      <strong>{statusText(mode, result, busy, paused)}</strong>
+      <strong>{statusText(mode, result, activeBusy, activePaused)}</strong>
     </section>
   );
 }
 
 function Field({ label, value }: { label: string; value: string | undefined }) {
-  const displayValue = textValue(value);
+  const displayValue = textValue(compactFieldValue(value));
+  const fullValue = textValue(value);
   return (
-    <div className="field" title={`${label}: ${displayValue}`}>
+    <div className="field" title={`${label}: ${fullValue}`}>
       <span>{label}</span>
       <strong>{displayValue}</strong>
     </div>
-  );
-}
-
-type DetailField = {
-  label: string;
-  value: string | undefined;
-};
-
-function DetailCard({
-  title,
-  icon,
-  fields,
-}: {
-  title: string;
-  icon: React.ReactNode;
-  fields: DetailField[];
-}) {
-  const visibleFields = fields.filter((field) => hasDisplayValue(field.value));
-  if (visibleFields.length === 0) {
-    return null;
-  }
-  return (
-    <MetricCard title={title} icon={icon} className="span-4">
-      {visibleFields.map((field) => (
-        <Field key={field.label} label={field.label} value={field.value} />
-      ))}
-    </MetricCard>
   );
 }
 
@@ -381,11 +394,15 @@ function createRunId(kind: RunKind) {
   return `${kind}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function appendLine(result: CommandResult | null, stream: OutputEvent["stream"], line: string): CommandResult {
+function appendLine(
+  result: CommandResult | null,
+  stream: OutputEvent["stream"],
+  line: string,
+  summaryDelta: Record<string, string> = {},
+): CommandResult {
   const base = result ?? EMPTY_RESULT;
   const text = stream === "system" ? `[system] ${line}` : line;
-  const parsedSummary = parseSummaryFromLine(line);
-  const summary = Object.keys(parsedSummary).length > 0 ? { ...base.summary, ...parsedSummary } : base.summary;
+  const summary = Object.keys(summaryDelta).length > 0 ? { ...base.summary, ...summaryDelta } : base.summary;
   if (stream === "stderr") {
     return {
       ...base,
@@ -462,30 +479,13 @@ function formatDiagnosticsLine(line: string) {
     return "Scanning for MID360 devices...";
   }
   if (trimmed.startsWith("discovery: found lidar")) {
-    const summary = parseSummaryFromLine(trimmed);
-    const parts = [
-      textValue(summary.ip, ""),
-      textValue(summary.sn, ""),
-      textValue(summary.iface_ip, ""),
-    ].filter(Boolean);
-    return `Device discovered${parts.length ? `: ${parts.join(" · ")}` : "."}`;
+    return "Device discovered.";
   }
   if (trimmed === "stopped" || trimmed.startsWith("stopped.")) {
     return "Diagnostics stopped.";
   }
   if (trimmed.startsWith("elapsed=")) {
-    const summary = parseSummaryFromLine(trimmed);
-    const parts = [
-      textValue(summary.elapsed, ""),
-      textValue(summary.ip, ""),
-      textValue(summary.link, ""),
-      textValue(summary.health, ""),
-      textValue(summary.core_temp, ""),
-      textValue(summary.points, ""),
-      textValue(summary.point_packets, ""),
-      textValue(summary.imu, ""),
-    ].filter(Boolean);
-    return parts.length ? parts.join(" · ") : "Sample received.";
+    return "Sample received.";
   }
   if (trimmed.includes("=")) {
     return "";
@@ -525,32 +525,106 @@ function backendState(cliInfo: CliInfo | null) {
   return cliInfo.exists ? "ready" : "missing";
 }
 
+function lidarNetworkLabel(status: LidarNetworkStatus | null) {
+  if (!status) return "Checking Ethernet...";
+  if (status.state === "ready") {
+    const address = status.ip ? `${status.ip}/${status.prefix ?? 24}` : "192.168.1.x";
+    return `${status.temporary ? "Temporary" : "Ready"} · ${status.iface ?? "Ethernet"} · ${address}`;
+  }
+  if (status.state === "needsSetup") {
+    return `Setup needed · ${status.iface ?? "Ethernet"} · add ${status.proposedIp ? `${status.proposedIp}/24` : "a 192.168.1.x address"}`;
+  }
+  if (status.state === "noLink") {
+    return status.iface ? `No Ethernet link · ${status.iface}` : "No Ethernet adapter";
+  }
+  return "Network check unavailable";
+}
+
+function NetworkSetupField({
+  status,
+  loading,
+  commandBusy,
+  onConfigure,
+  onRelease,
+}: {
+  status: LidarNetworkStatus | null;
+  loading: boolean;
+  commandBusy: boolean;
+  onConfigure: () => void;
+  onRelease: () => void;
+}) {
+  const state = status?.state ?? "unavailable";
+  const icon = loading ? (
+    <Loader2 className="spin" size={15} />
+  ) : state === "ready" ? (
+    <CheckCircle2 size={15} />
+  ) : state === "noLink" ? (
+    <Cable size={15} />
+  ) : (
+    <CircleAlert size={15} />
+  );
+  const canConfigure = status?.state === "needsSetup" && Boolean(status.iface && status.proposedIp);
+  const canRelease = status?.state === "ready" && status.temporary;
+
+  return (
+    <div className="network-setup-field">
+      <span>Lidar Network</span>
+      <div className={`network-setup-status ${state} ${loading ? "loading" : ""}`} title={status?.detail} aria-live="polite">
+        {icon}
+        <strong>{loading ? "Checking Ethernet..." : lidarNetworkLabel(status)}</strong>
+        {canConfigure && (
+          <button type="button" disabled={loading || commandBusy} onClick={onConfigure}>
+            Configure
+          </button>
+        )}
+        {canRelease && (
+          <button type="button" disabled={loading || commandBusy} onClick={onRelease}>
+            Release
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ControlStrip({
   iface,
   timeoutSec,
-  autoBindIp,
-  noAutoBind,
+  networkStatus,
+  networkBusy,
+  commandBusy,
   onIface,
   onTimeout,
-  onAutoBindIp,
-  onNoAutoBind,
+  onConfigureNetwork,
+  onReleaseNetwork,
   onCheck,
 }: {
   iface: string;
   timeoutSec: number;
-  autoBindIp: string;
-  noAutoBind: boolean;
+  networkStatus: LidarNetworkStatus | null;
+  networkBusy: boolean;
+  commandBusy: boolean;
   onIface: (value: string) => void;
   onTimeout: (value: number) => void;
-  onAutoBindIp: (value: string) => void;
-  onNoAutoBind: (value: boolean) => void;
+  onConfigureNetwork: () => void;
+  onReleaseNetwork: () => void;
   onCheck: () => void;
 }) {
   return (
     <section className="control-strip diagnostics-controls">
       <label>
         <span>Interface</span>
-        <input value={iface} onChange={(event) => onIface(event.target.value)} placeholder="auto" />
+        <div className="select-control">
+          <select value={iface} disabled={networkBusy} onChange={(event) => onIface(event.target.value)} aria-label="Ethernet interface">
+            <option value="">Auto</option>
+            {(networkStatus?.interfaces ?? []).map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+          <ChevronDown size={16} aria-hidden="true" />
+        </div>
       </label>
       <label>
         <span>Discovery Timeout</span>
@@ -562,17 +636,16 @@ function ControlStrip({
           onChange={(event) => onTimeout(Number(event.target.value))}
         />
       </label>
-      <label>
-        <span>Auto-bind IP</span>
-        <input value={autoBindIp} onChange={(event) => onAutoBindIp(event.target.value)} />
-      </label>
-      <label className="toggle-row">
-        <input type="checkbox" checked={noAutoBind} onChange={(event) => onNoAutoBind(event.target.checked)} />
-        <span>No auto-bind</span>
-      </label>
-      <button className="secondary" title={!isTauriRuntime() ? tauriRequiredMessage() : undefined} onClick={onCheck}>
+      <NetworkSetupField
+        status={networkStatus}
+        loading={networkBusy}
+        commandBusy={commandBusy}
+        onConfigure={onConfigureNetwork}
+        onRelease={onReleaseNetwork}
+      />
+      <button className="secondary" disabled={networkBusy} title={!isTauriRuntime() ? tauriRequiredMessage() : undefined} onClick={onCheck}>
         <RefreshCw size={17} />
-        Check
+        Refresh
       </button>
     </section>
   );
@@ -623,72 +696,60 @@ function WorkbenchHeader({
   result,
   busy,
   paused,
-  view,
   iface,
   timeoutSec,
-  autoBindIp,
-  noAutoBind,
+  networkStatus,
+  networkBusy,
   stopping,
   onIface,
   onTimeout,
-  onAutoBindIp,
-  onNoAutoBind,
+  onConfigureNetwork,
+  onReleaseNetwork,
   onCheck,
   onMonitor,
   onPause,
   onResume,
   onStop,
-  onView,
 }: {
   mode: PanelMode;
   title: string;
   result: CommandResult | null;
   busy: RunKind | null;
   paused: boolean;
-  view: DiagnosticsView;
   iface: string;
   timeoutSec: number;
-  autoBindIp: string;
-  noAutoBind: boolean;
+  networkStatus: LidarNetworkStatus | null;
+  networkBusy: boolean;
   stopping: boolean;
   onIface: (value: string) => void;
   onTimeout: (value: number) => void;
-  onAutoBindIp: (value: string) => void;
-  onNoAutoBind: (value: boolean) => void;
+  onConfigureNetwork: () => void;
+  onReleaseNetwork: () => void;
   onCheck: () => void;
   onMonitor: () => void;
   onPause: () => void;
   onResume: () => void;
   onStop: () => void;
-  onView: (view: DiagnosticsView) => void;
 }) {
   return (
     <section className="workbench-header">
       <div className="workbench-title">
         <div>
-          <p className="eyebrow">Tauri Desktop Demo</p>
           <h1>{title}</h1>
         </div>
         <ActionBar busy={busy} stopping={stopping} paused={paused} onMonitor={onMonitor} onPause={onPause} onResume={onResume} onStop={onStop} />
       </div>
       <StatusBanner mode={mode} result={result} busy={busy} paused={paused} />
-      <div className="view-tabs" role="tablist" aria-label="Diagnostics views">
-        <button className={view === "overview" ? "active" : ""} onClick={() => onView("overview")}>
-          Overview
-        </button>
-        <button className={view === "details" ? "active" : ""} onClick={() => onView("details")}>
-          Details
-        </button>
-      </div>
       <ControlStrip
         iface={iface}
         timeoutSec={timeoutSec}
-        autoBindIp={autoBindIp}
-        noAutoBind={noAutoBind}
+        networkStatus={networkStatus}
+        networkBusy={networkBusy}
+        commandBusy={busy !== null}
         onIface={onIface}
         onTimeout={onTimeout}
-        onAutoBindIp={onAutoBindIp}
-        onNoAutoBind={onNoAutoBind}
+        onConfigureNetwork={onConfigureNetwork}
+        onReleaseNetwork={onReleaseNetwork}
         onCheck={onCheck}
       />
     </section>
@@ -738,149 +799,57 @@ function MonitorCards({ result }: { result: CommandResult | null }) {
   );
 }
 
-function DetailsCards({ result, cliInfo }: { result: CommandResult | null; cliInfo: CliInfo | null }) {
-  const product = result?.summary.product;
-  const summary = result?.summary ?? {};
-  return (
-    <section className="grid details-grid">
-      <DetailCard
-        title="Identity"
-        icon={<Activity size={18} />}
-        fields={[
-          { label: "Model", value: deviceModel(summary.dev_type, product) },
-          { label: "Device Type", value: summary.dev_type },
-          { label: "Handle", value: summary.handle },
-          { label: "Serial", value: summary.sn },
-          { label: "MAC", value: summary.mac },
-          { label: "Product Info", value: product },
-        ]}
-      />
-      <DetailCard
-        title="Network"
-        icon={<Cable size={18} />}
-        fields={[
-          { label: "Lidar IP", value: summary.ip },
-          { label: "Mask", value: summary.mask },
-          { label: "Gateway", value: summary.gateway },
-          { label: "Point Endpoint", value: summary.net_point },
-          { label: "IMU Endpoint", value: summary.net_imu },
-          { label: "State Endpoint", value: summary.net_state },
-          { label: "Control Endpoint", value: summary.net_control },
-          { label: "Log Endpoint", value: summary.net_log },
-        ]}
-      />
-      <DetailCard
-        title="Firmware"
-        icon={<TerminalSquare size={18} />}
-        fields={[
-          { label: "App Version", value: summary.fw },
-          { label: "Loader Version", value: summary.loader },
-          { label: "Hardware", value: summary.hw },
-          { label: "Firmware Type", value: summary.fw_type ?? productField(product, "FmType") },
-          { label: "Firmware Ver", value: productField(product, "FmVer") },
-          { label: "Build Time", value: productField(product, "BuildTime") },
-          { label: "Flash Status", value: summary.flash },
-          { label: "GUI Backend", value: cliInfo?.version ?? undefined },
-        ]}
-      />
-      <DetailCard
-        title="Health"
-        icon={<Gauge size={18} />}
-        fields={[
-          { label: "Health", value: summary.health },
-          { label: "Diag", value: summary.diag },
-          { label: "Status Code", value: summary.status_code },
-          { label: "HMS", value: summary.hms },
-          { label: "Core Temp", value: summary.core_temp },
-          { label: "Env Temp", value: summary.env_temp },
-          { label: "Power Ups", value: summary.powerups },
-          { label: "Info Source", value: summary.info_src },
-          { label: "Info Age", value: summary.info_age },
-        ]}
-      />
-      <DetailCard
-        title="Configuration"
-        icon={<Settings2 size={18} />}
-        fields={[
-          { label: "PCL Data Type", value: summary.pcl_data_type },
-          { label: "Pattern", value: summary.pattern },
-          { label: "Dual Emit", value: summary.dual_emit },
-          { label: "Frame Rate", value: summary.frame_rate },
-          { label: "FOV Enable", value: summary.fov_enable },
-          { label: "Detect Mode", value: summary.detect_mode },
-          { label: "Blind Spot", value: summary.blind_spot },
-          { label: "ROI", value: summary.roi },
-          { label: "Boot Work", value: summary.boot_work },
-          { label: "Work", value: summary.work },
-          { label: "Point Send", value: summary.point_send },
-          { label: "IMU Enable", value: summary.imu_enable },
-          { label: "Glass Heat", value: summary.glass_heat },
-          { label: "Glass Heat State", value: summary.glass_heat_state },
-          { label: "FUSA", value: summary.fusa },
-          { label: "Force Heat", value: summary.force_heat },
-          { label: "ESC Mode", value: summary.esc_mode },
-          { label: "PPS Sync", value: summary.pps_sync },
-        ]}
-      />
-      <DetailCard
-        title="Time Sync"
-        icon={<TerminalSquare size={18} />}
-        fields={[
-          { label: "Time Sync", value: summary.time_sync },
-          { label: "Time Sync Raw", value: summary.time_sync_raw },
-          { label: "Local Time", value: summary.local_time },
-          { label: "Last Sync", value: summary.last_sync },
-          { label: "Time Offset", value: summary.time_offset },
-        ]}
-      />
-      <DetailCard
-        title="Streams"
-        icon={<Cable size={18} />}
-        fields={[
-          { label: "Points", value: summary.points },
-          { label: "Point Packets", value: summary.point_packets },
-          { label: "Point Mbps", value: summary.point_mbps },
-          { label: "IMU", value: summary.imu },
-          { label: "Last Packet Type", value: summary.type },
-          { label: "Frame", value: summary.frame },
-          { label: "UDP", value: summary.udp },
-        ]}
-      />
-    </section>
-  );
-}
-
 export default function App() {
   const [mode, setMode] = useState<PanelMode>("diagnostics");
-  const [diagnosticsView, setDiagnosticsView] = useState<DiagnosticsView>("overview");
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [cliInfo, setCliInfo] = useState<CliInfo | null>(null);
   const [iface, setIface] = useState("");
   const [timeoutSec, setTimeoutSec] = useState(5);
-  const [autoBindIp, setAutoBindIp] = useState("192.168.1.5");
-  const [noAutoBind, setNoAutoBind] = useState(false);
+  const [networkStatus, setNetworkStatus] = useState<LidarNetworkStatus | null>(null);
+  const [networkBusy, setNetworkBusy] = useState(false);
   const [busy, setBusy] = useState<RunKind | null>(null);
   const [stoppingRunId, setStoppingRunId] = useState<string | null>(null);
   const [pausedRunId, setPausedRunId] = useState<string | null>(null);
   const [monitorResult, setMonitorResult] = useState<CommandResult | null>(null);
+  const [previewResult, setPreviewResult] = useState<CommandResult | null>(null);
+  const [latestRunKind, setLatestRunKind] = useState<RunKind | null>(null);
+  const [previewState, setPreviewState] = useState<PreviewState>("idle");
+  const [previewNotice, setPreviewNotice] = useState<PreviewNotice>(null);
   const [error, setError] = useState("");
   const activeRunRef = useRef<{ runId: string; kind: RunKind } | null>(null);
   const latestMonitorRunRef = useRef<string | null>(null);
+  const latestPreviewRunRef = useRef<string | null>(null);
+  const previewFirstFrameRunRef = useRef<string | null>(null);
 
-  const activeResult = monitorResult;
-  const latestResult = monitorResult;
+  const latestResult = latestRunKind === "monitor" ? monitorResult : latestRunKind === "preview" ? previewResult : null;
 
   const options: RunOptions = useMemo(
     () => ({
       iface: iface.trim() || undefined,
       timeoutSec,
-      noAutoBind,
-      autoBindIp: autoBindIp.trim() || undefined,
     }),
-    [autoBindIp, iface, noAutoBind, timeoutSec],
+    [iface, timeoutSec],
   );
 
   const backend = backendState(cliInfo);
   const paused = busy !== null && pausedRunId === activeRunRef.current?.runId;
+  const closeAbout = useCallback(() => setAboutOpen(false), []);
+  const handlePreviewFirstFrame = useCallback((runId: string) => {
+    if (previewFirstFrameRunRef.current === runId) {
+      return;
+    }
+    previewFirstFrameRunRef.current = runId;
+    setPreviewState("streaming");
+    setPreviewNotice(null);
+  }, []);
+
+  function appendRunLine(kind: RunKind, stream: OutputEvent["stream"], line: string, summary?: Record<string, string>) {
+    if (kind === "monitor") {
+      setMonitorResult((current) => appendLine(current, stream, line, summary));
+      return;
+    }
+    setPreviewResult((current) => appendLine(current, stream, line, summary));
+  }
 
   async function refreshCliInfo(options: { quiet?: boolean } = {}) {
     if (!options.quiet) {
@@ -900,8 +869,134 @@ export default function App() {
     }
   }
 
+  async function refreshLidarNetwork(options: { quiet?: boolean; selectedIface?: string } = {}) {
+    if (!isTauriRuntime()) {
+      const status: LidarNetworkStatus = {
+        state: "unavailable",
+        interfaces: [],
+        iface: null,
+        ip: null,
+        prefix: null,
+        proposedIp: null,
+        temporary: false,
+        detail: tauriRequiredMessage(),
+      };
+      setNetworkStatus(status);
+      return status;
+    }
+
+    try {
+      const selectedIface = options.selectedIface ?? iface;
+      const status = await invoke<LidarNetworkStatus>("get_lidar_network_status", {
+        iface: selectedIface.trim() || null,
+      });
+      setNetworkStatus(status);
+      return status;
+    } catch (err) {
+      const detail = String(err);
+      const status: LidarNetworkStatus = {
+        state: "unavailable",
+        interfaces: [],
+        iface: null,
+        ip: null,
+        prefix: null,
+        proposedIp: null,
+        temporary: false,
+        detail,
+      };
+      setNetworkStatus(status);
+      if (!options.quiet) {
+        setError(detail);
+      }
+      return status;
+    }
+  }
+
+  async function checkEnvironment() {
+    setError("");
+    setNetworkBusy(true);
+    try {
+      await Promise.all([refreshCliInfo({ quiet: true }), refreshLidarNetwork({ quiet: true })]);
+    } finally {
+      setNetworkBusy(false);
+    }
+  }
+
+  async function selectInterface(value: string) {
+    setIface(value);
+    setError("");
+    setNetworkBusy(true);
+    try {
+      await refreshLidarNetwork({ quiet: true, selectedIface: value });
+    } finally {
+      setNetworkBusy(false);
+    }
+  }
+
+  async function configureLidarNetwork() {
+    if (!networkStatus?.iface || !networkStatus.proposedIp || !isTauriRuntime()) {
+      return;
+    }
+    setError("");
+    setNetworkBusy(true);
+    try {
+      const status = await invoke<LidarNetworkStatus>("configure_lidar_network", {
+        iface: networkStatus.iface,
+        ip: networkStatus.proposedIp,
+      });
+      setNetworkStatus(status);
+    } catch (err) {
+      setError(String(err));
+      await refreshLidarNetwork({ quiet: true });
+    } finally {
+      setNetworkBusy(false);
+    }
+  }
+
+  async function releaseLidarNetwork() {
+    if (!isTauriRuntime()) {
+      return;
+    }
+    setError("");
+    setNetworkBusy(true);
+    try {
+      await invoke<void>("release_lidar_network");
+      await refreshLidarNetwork({ quiet: true });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setNetworkBusy(false);
+    }
+  }
+
+  async function ensureLidarNetwork(kind: RunKind) {
+    if (!isTauriRuntime()) {
+      return true;
+    }
+    setNetworkBusy(true);
+    const status = await refreshLidarNetwork({ quiet: true });
+    setNetworkBusy(false);
+    if (status.state === "ready") {
+      return true;
+    }
+
+    const title = status.state === "needsSetup" ? "Network setup required" : status.state === "noLink" ? "Ethernet link required" : "Network check failed";
+    setError(`${title}: ${status.detail}`);
+    if (kind === "preview") {
+      setPreviewState("error");
+      setPreviewNotice({
+        tone: status.state === "unavailable" ? "error" : "warning",
+        title,
+        detail: status.detail,
+        hint: status.state === "needsSetup" ? "Open Diagnostics and select Configure under Lidar Network." : undefined,
+      });
+    }
+    return false;
+  }
+
   useEffect(() => {
     void refreshCliInfo({ quiet: true });
+    void refreshLidarNetwork({ quiet: true });
   }, []);
 
   async function stopActiveRun() {
@@ -911,16 +1006,37 @@ export default function App() {
     }
     setStoppingRunId(active.runId);
     setPausedRunId(null);
-    setMonitorResult((current) => appendLine(current, "system", "stop requested"));
+    if (active.kind === "preview") {
+      setPreviewState("stopping");
+      setPreviewNotice({
+        tone: "info",
+        title: "Stopping preview",
+        detail: "Stopping the point cloud process.",
+      });
+    }
+    appendRunLine(active.kind, "system", "stop requested");
     try {
       const found = await invoke<boolean>("stop_run", { runId: active.runId });
       if (!found) {
         setError("Active command was already finished.");
         setStoppingRunId(null);
+        if (active.kind === "preview" && latestPreviewRunRef.current === active.runId) {
+          latestPreviewRunRef.current = null;
+          setPreviewState("stopped");
+          setPreviewNotice({
+            tone: "info",
+            title: "Preview stopped",
+            detail: "The point cloud process has already finished.",
+          });
+        }
       }
     } catch (err) {
       setError(String(err));
       setStoppingRunId(null);
+      if (active.kind === "preview") {
+        setPreviewState("error");
+        setPreviewNotice(previewNoticeFromError(String(err)));
+      }
     }
   }
 
@@ -936,7 +1052,7 @@ export default function App() {
         return;
       }
       setPausedRunId(active.runId);
-      setMonitorResult((current) => appendLine(current, "system", "monitoring paused"));
+      appendRunLine(active.kind, "system", `${modeLabel(active.kind)} paused`);
     } catch (err) {
       setError(String(err));
     }
@@ -954,16 +1070,24 @@ export default function App() {
         return;
       }
       setPausedRunId(null);
-      setMonitorResult((current) => appendLine(current, "system", "monitoring resumed"));
+      appendRunLine(active.kind, "system", `${modeLabel(active.kind)} resumed`);
     } catch (err) {
       setError(String(err));
     }
   }
 
   async function runMonitor() {
+    if (busy) {
+      setError(`${modeLabel(busy)} is running. Stop it before starting Diagnostics.`);
+      return;
+    }
+    if (!(await ensureLidarNetwork("monitor"))) {
+      return;
+    }
     const runId = createRunId("monitor");
     activeRunRef.current = { runId, kind: "monitor" };
     latestMonitorRunRef.current = runId;
+    setLatestRunKind("monitor");
     setBusy("monitor");
     setStoppingRunId(null);
     setPausedRunId(null);
@@ -987,7 +1111,7 @@ export default function App() {
       if (latestMonitorRunRef.current !== runId) {
         return;
       }
-      setMonitorResult((current) => appendLine(current, event.payload.stream, event.payload.line));
+      setMonitorResult((current) => appendLine(current, event.payload.stream, event.payload.line, event.payload.summary));
       if (isCompletionMarker(event.payload.line) && activeRunRef.current?.runId === runId) {
         activeRunRef.current = null;
         setPausedRunId(null);
@@ -1034,6 +1158,150 @@ export default function App() {
     }
   }
 
+  async function runPreview() {
+    if (busy && activeRunRef.current?.kind !== "preview") {
+      await switchToPointCloudPreview();
+      return;
+    }
+    if (busy === "preview") {
+      return;
+    }
+    if (!(await ensureLidarNetwork("preview"))) {
+      return;
+    }
+    const runId = createRunId("preview");
+    activeRunRef.current = { runId, kind: "preview" };
+    latestPreviewRunRef.current = runId;
+    previewFirstFrameRunRef.current = null;
+    setLatestRunKind("preview");
+    setBusy("preview");
+    setPreviewState("starting");
+    setPreviewNotice({
+      tone: "info",
+      title: "Starting preview",
+      detail: "Starting Livox SDK discovery.",
+      hint: "The preview will scan available Ethernet interfaces for MID360 broadcasts.",
+    });
+    setStoppingRunId(null);
+    setPausedRunId(null);
+    setError("");
+    setMode("pointcloud");
+    setPreviewResult({
+      ...EMPTY_RESULT,
+      stdout: "[system] starting point cloud preview...",
+    });
+    if (!isTauriRuntime()) {
+      setError(tauriRequiredMessage());
+      setPreviewNotice(previewNoticeFromError(tauriRequiredMessage()));
+      setBusy(null);
+      setPreviewState("error");
+      activeRunRef.current = null;
+      return;
+    }
+    const unlistenOutput = await listen<OutputEvent>("diagnostics://output", (event) => {
+      if (event.payload.runId !== runId || latestPreviewRunRef.current !== runId) {
+        return;
+      }
+      const nextPreviewState = previewStateFromLine(event.payload.line);
+      if (nextPreviewState) {
+        setPreviewState(nextPreviewState);
+      }
+      const nextNotice = previewNoticeFromLine(event.payload.line);
+      if (nextNotice) {
+        setPreviewNotice((current) => nextPreviewNotice(current, nextNotice));
+      }
+      setPreviewResult((current) => appendLine(current, event.payload.stream, event.payload.line, event.payload.summary));
+    });
+    const unlistenComplete = await listen<CompleteEvent>("diagnostics://complete", (event) => {
+      if (event.payload.runId !== runId) {
+        return;
+      }
+      if (latestPreviewRunRef.current !== runId) {
+        unlistenOutput();
+        unlistenComplete();
+        return;
+      }
+      if (event.payload.result) {
+        setPreviewResult((current) => mergeResult(current, event.payload.result as CommandResult));
+      }
+      if (event.payload.error) {
+        setPreviewResult((current) => appendLine(current, "stderr", event.payload.error ?? "unknown error"));
+        setError(event.payload.error);
+        setPreviewNotice(previewNoticeFromError(event.payload.error));
+        setPreviewState("error");
+      } else if (event.payload.result?.ok || isStoppedResult(event.payload.result ?? null)) {
+        setPreviewState("stopped");
+        setPreviewNotice({
+          tone: "info",
+          title: "Preview stopped",
+          detail: isStoppedResult(event.payload.result ?? null) ? "Point cloud preview was stopped by user." : "Point cloud preview finished.",
+        });
+      } else {
+        setPreviewState("error");
+        const status = event.payload.result?.summary.status;
+        if (status) {
+          setPreviewNotice((current) => nextPreviewNotice(current, previewNoticeFromLine(`ERROR: ${status}`) ?? previewNoticeFromError(status)));
+        } else {
+          setPreviewNotice((current) =>
+            current?.tone === "error"
+              ? current
+              : {
+                  tone: "error",
+                  title: "Preview failed",
+                  detail: "The point cloud process exited before streaming data.",
+                  hint: "Open Logs for the full backend output.",
+                },
+          );
+        }
+      }
+      if (activeRunRef.current?.runId === runId) {
+        activeRunRef.current = null;
+      }
+      setBusy(null);
+      setStoppingRunId(null);
+      setPausedRunId(null);
+      unlistenOutput();
+      unlistenComplete();
+    });
+    try {
+      await invoke<void>("run_preview", { runId, options });
+    } catch (err) {
+      setPreviewResult((current) => appendLine(current, "stderr", String(err)));
+      setError(String(err));
+      setPreviewNotice(previewNoticeFromError(String(err)));
+      unlistenOutput();
+      unlistenComplete();
+      setBusy(null);
+      setStoppingRunId(null);
+      setPausedRunId(null);
+      setPreviewState("error");
+      activeRunRef.current = null;
+    }
+  }
+
+  async function switchToPointCloudPreview() {
+    setMode("pointcloud");
+    const active = activeRunRef.current;
+    if (!active || active.kind === "preview") {
+      return;
+    }
+
+    setError("");
+    setPreviewState("stopping");
+    setPreviewNotice({
+      tone: "info",
+      title: "Switching to PointCloud Preview",
+      detail: `Stopping ${modeLabel(active.kind)} before starting the point cloud stream.`,
+    });
+    await stopActiveRun();
+  }
+
+  useEffect(() => {
+    if (mode === "pointcloud" && !busy && !latestPreviewRunRef.current) {
+      void runPreview();
+    }
+  }, [mode, busy]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -1051,23 +1319,35 @@ export default function App() {
             <Gauge size={18} />
             Diagnostics
           </button>
+          <button className={mode === "pointcloud" ? "active" : ""} onClick={() => void switchToPointCloudPreview()}>
+            <ScanLine size={18} />
+            Preview
+          </button>
           <button className={mode === "logs" ? "active" : ""} onClick={() => setMode("logs")}>
             <TerminalSquare size={18} />
             Logs
           </button>
         </nav>
-      </aside>
-
-      <main>
-        <header className="terminal-statusbar">
+        <button
+          type="button"
+          className="sidebar-status sidebar-about-trigger"
+          onClick={() => setAboutOpen(true)}
+          aria-haspopup="dialog"
+          aria-label="About Livox MID360 Diagnostics"
+          title="About Livox MID360 Diagnostics"
+        >
           <div className="terminal-status-left">
             <span className={`status-led ${paused ? "paused" : busy ? "running" : backend}`}></span>
             <strong>livox-mid360-diagnostics</strong>
           </div>
-          <div className="terminal-status-right">
-            <span>{cliInfo?.version ?? "Version unavailable"}</span>
-          </div>
-        </header>
+          <span className="sidebar-about-meta">
+            <span>{compactVersion(cliInfo?.version)}</span>
+            <Info size={14} aria-hidden="true" />
+          </span>
+        </button>
+      </aside>
+
+      <main>
         {mode === "diagnostics" ? (
           <>
             <WorkbenchHeader
@@ -1076,47 +1356,55 @@ export default function App() {
               result={monitorResult}
               busy={busy}
               paused={paused}
-              view={diagnosticsView}
               iface={iface}
               timeoutSec={timeoutSec}
-              autoBindIp={autoBindIp}
-              noAutoBind={noAutoBind}
+              networkStatus={networkStatus}
+              networkBusy={networkBusy}
               stopping={stoppingRunId !== null}
-              onIface={setIface}
+              onIface={selectInterface}
               onTimeout={setTimeoutSec}
-              onAutoBindIp={setAutoBindIp}
-              onNoAutoBind={setNoAutoBind}
-              onCheck={refreshCliInfo}
+              onConfigureNetwork={configureLidarNetwork}
+              onReleaseNetwork={releaseLidarNetwork}
+              onCheck={checkEnvironment}
               onMonitor={runMonitor}
               onPause={pauseActiveRun}
               onResume={resumeActiveRun}
               onStop={stopActiveRun}
-              onView={setDiagnosticsView}
             />
 
             {error && <div className="error-banner">{error}</div>}
 
-            {diagnosticsView === "overview" ? (
-              <>
-                <MonitorCards result={monitorResult} />
+            <MonitorCards result={monitorResult} />
 
-                <section className="log-panel">
-                  <div className="panel-heading">
-                    <h2>Diagnostics Output</h2>
-                    <span>{paused ? "Paused" : busy ? "Running" : isStoppedResult(activeResult) ? "Stopped" : activeResult?.ok ? "Completed" : activeResult ? "Failed" : "Waiting"}</span>
-                  </div>
-                  <RawLog result={activeResult} />
-                </section>
-              </>
-            ) : (
-              <DetailsCards result={latestResult} cliInfo={cliInfo} />
-            )}
+            <section className="log-panel">
+              <div className="panel-heading">
+                <h2>Diagnostics Output</h2>
+                <span>{paused && busy === "monitor" ? "Paused" : busy === "monitor" ? "Running" : isStoppedResult(monitorResult) ? "Stopped" : monitorResult?.ok ? "Completed" : monitorResult ? "Failed" : "Waiting"}</span>
+              </div>
+              <RawLog result={monitorResult} />
+            </section>
           </>
+        ) : mode === "pointcloud" ? (
+          <ErrorBoundary fallbackTitle="PointCloud Preview failed">
+            <Suspense fallback={<div className="module-loading">Loading PointCloud Preview...</div>}>
+              <PointCloudPreview
+                activeRunId={activeRunRef.current?.kind === "preview" ? activeRunRef.current.runId : null}
+                state={previewState}
+                running={busy === "preview"}
+                switching={busy === "monitor" && stoppingRunId !== null}
+                stopping={stoppingRunId !== null && activeRunRef.current?.kind === "preview"}
+                error={error}
+                notice={previewNotice}
+                onFirstFrame={handlePreviewFirstFrame}
+                onStart={runPreview}
+                onStop={stopActiveRun}
+              />
+            </Suspense>
+          </ErrorBoundary>
         ) : (
           <>
             <header className="topbar">
               <div>
-                <p className="eyebrow">Tauri Desktop Demo</p>
                 <h1>Command Logs</h1>
               </div>
             </header>
@@ -1131,6 +1419,7 @@ export default function App() {
           </>
         )}
       </main>
+      {aboutOpen && <AboutDialog version={APP_VERSION} onClose={closeAbout} />}
     </div>
   );
 }
